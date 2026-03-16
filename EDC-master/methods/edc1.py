@@ -345,9 +345,7 @@ class EDC:
                         os.mkdir(save_path)
                     anomaly_maps = F.interpolate(result['p_all'], size=xo.shape[1:3], mode='bilinear')
                     for i in range(xo.shape[0]):
-                        image = xo[i].cpu().numpy()
-                        image = np.transpose(image, (1,2,0))
-                        image = (image * 255).astype(np.uint8)
+                        image = xo[i].cpu().numpy().astype(np.uint8)
                         # anomaly_map = anomaly_maps[i].cpu().permute(1, 2, 0).numpy()
                         anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
                         file_name = os.path.basename(file_names[i])
