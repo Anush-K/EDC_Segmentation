@@ -275,7 +275,10 @@ class EDC:
         pickle.dump(train_log, f_save)
         f_save.close()
 
-        eval_dict = self.evaluate(device=device, args=args, save_visual=True)
+        eval_dict = self.evaluate(device=device, args=args)
+        
+        print("Generating heatmaps...")
+        self.generate_heatmaps(device, args)
         eval_dict.update({'eval/best_auc': best_eval_auc, 'eval/best_it': best_it})
         return eval_dict
 
@@ -413,6 +416,45 @@ class EDC:
             (anomaly_map_norm * 255).astype(np.uint8)
             )
 
+    def generate_heatmaps(self, device, args):
+
+        self.model.eval()
+
+        save_path = os.path.join(args.save_dir, args.save_name, "heatmap")
+        os.makedirs(save_path, exist_ok=True)
+
+        eval_loader = self.loader_dict['eval']
+
+        with torch.no_grad():
+
+            for _, x, xo, y, file_names in tqdm(eval_loader):
+
+                x = x.to(device)
+
+                result = self.model(x)
+
+                anomaly_maps = F.interpolate(
+                    result['p_all'],
+                    size=xo.shape[1:3],
+                    mode='bilinear'
+                )
+
+                for i in range(xo.shape[0]):
+
+                    image = xo[i].cpu().numpy()
+                    image = np.transpose(image,(1,2,0))
+                    image = (image*255).astype(np.uint8)
+
+                    anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
+
+                    file_name = os.path.basename(file_names[i])
+
+                    self.save_anomaly_map(
+                        anomaly_map,
+                        image,
+                        save_path,
+                        file_name
+                    )
 
 def cvt2heatmap(gray):
     heatmap = cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
