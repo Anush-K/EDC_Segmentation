@@ -417,6 +417,7 @@ class EDC:
             )
 
     def generate_heatmaps(self, device, args):
+        print("Generating anomaly heatmaps...")
 
         self.model.eval()
 
@@ -424,8 +425,6 @@ class EDC:
         os.makedirs(save_path, exist_ok=True)
 
         eval_loader = self.loader_dict['eval']
-
-        print(f"Saving heatmaps to: {save_path}")
 
         with torch.no_grad():
 
