@@ -179,6 +179,8 @@ def main_worker(gpu, args):
     # runner.train(args, device=device, logger=logger)
     # logging.warning(f"Training and Evaluation are COMPLETED!")
     eval_dict = runner.train(args, device=device, logger=logger)
+    print("\nGenerating anomaly heatmaps for segmentation...\n")
+    runner.generate_heatmaps(device, args)
     best_thr = eval_dict['eval/best_thr']  
     logging.warning(f"Training and Evaluation are COMPLETED!")
 

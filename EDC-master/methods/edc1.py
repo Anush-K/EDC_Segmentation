@@ -425,6 +425,8 @@ class EDC:
 
         eval_loader = self.loader_dict['eval']
 
+        print(f"Saving heatmaps to: {save_path}")
+
         with torch.no_grad():
 
             for _, x, xo, y, file_names in tqdm(eval_loader):
