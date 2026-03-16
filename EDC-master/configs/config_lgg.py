@@ -15,8 +15,8 @@ if torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 
-#BASE_DIR = "/home/cs24d0008/EDC_SSL"
-BASE_DIR = "/Users/anushk/Desktop/EDC_Segmentation"
+BASE_DIR = "/home/cs24d0008/EDC_Segmentation"
+#BASE_DIR = "/Users/anushk/Desktop/EDC_Segmentation"
 
 CODE_DIR = os.path.join(BASE_DIR, "EDC-master")
 
