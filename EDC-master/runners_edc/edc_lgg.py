@@ -5,6 +5,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import logging
 import random
 
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,12 +22,11 @@ from datasets.dataset import AD_Dataset
 from datasets.data_utils import get_data_loader
 from models.edc import R50_R50
 import warnings
-from configs.config_isic2018 import DATASET_DIR, TEST_DIR
+from configs.config_lgg import DATASET_DIR, TEST_DIR
 from collections import Counter
 
 
 warnings.filterwarnings("ignore")
-
 
 
 def get_label(sample):
@@ -67,29 +67,11 @@ def main_worker(gpu, args):
     logger.warning(f"USE GPU: {args.gpu} for training")
 
     # Construct Dataset & DataLoader
-    # train_dset = AD_Dataset(name=args.dataset, train=True, data_dir=args.data_dir)
-    #train_dset = train_dset.get_dset()
-    train_dset = AD_Dataset(
-        name=args.dataset, 
-        train=True, 
-        data_dir=args.data_dir, 
-        img_size=args.img_size, 
-        crop_size=224, 
-        imagenet_norm=True
-    ).get_dset()
-
+    train_dset = AD_Dataset(name=args.dataset, train=True, data_dir=args.data_dir)
+    train_dset = train_dset.get_dset()
     print("TrainSet Image Number:", len(train_dset))
-    
-    eval_dset = AD_Dataset(
-        name=args.dataset,
-        train=False,
-        data_dir=args.data_dir,
-        img_size=args.img_size,
-        crop_size=224,
-        imagenet_norm=True
-    ).get_dset()
-    #eval_dset = AD_Dataset(name=args.dataset, train=False, data_dir=args.data_dir)
-    #eval_dset = eval_dset.get_dset()
+    eval_dset = AD_Dataset(name=args.dataset, train=False, data_dir=args.data_dir)
+    eval_dset = eval_dset.get_dset()
     print("EvalSet Image Number:", len(eval_dset))
 
     # Access labels directly
@@ -139,13 +121,12 @@ def main_worker(gpu, args):
         bn_pretrain=False,
     )
 
-
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.momentum = 0.01
 
     runner = EDC(
-        model=model, num_eval_iter=args.num_eval_iter, tb_log=tb_log, logger=logger, amap_reduction='mean'
+        model=model, num_eval_iter=args.num_eval_iter, tb_log=tb_log, logger=logger
     )
 
     logger.info(f"Number of Trainable Params: {count_parameters(runner.model)}")
@@ -159,7 +140,6 @@ def main_worker(gpu, args):
         lr_encoder=args.lr_encoder,
         weight_decay=args.weight_decay,
     )
-
 
     scheduler = get_multistep_schedule_with_warmup(
         optimizer, milestones=[1e10], gamma=0.2, num_warmup_steps=0
@@ -178,6 +158,7 @@ def main_worker(gpu, args):
         logger.info("⚠️ Using CPU (no GPU backend detected)")
 
     runner.model = runner.model.to(device)
+
     args.device = device  # optional, to use later inside train/eval
 
     # Move diffusion model to device
@@ -198,7 +179,7 @@ def main_worker(gpu, args):
     # runner.train(args, device=device, logger=logger)
     # logging.warning(f"Training and Evaluation are COMPLETED!")
     eval_dict = runner.train(args, device=device, logger=logger)
-    best_thr = eval_dict['eval/best_thr'] 
+    best_thr = eval_dict['eval/best_thr']  
     logging.warning(f"Training and Evaluation are COMPLETED!")
 
     # ================================
@@ -222,7 +203,7 @@ def main_worker(gpu, args):
         ]
     })
 
-    print("\n================ FINAL EVALUATION METRICS ISIC2018================\n")
+    print("\n================ FINAL EVALUATION METRICS - LGG ================\n")
     print(metrics_table.to_string(index=False, float_format="%.4f"))
 
     # ================================
@@ -261,9 +242,6 @@ def main_worker(gpu, args):
     )
 
     print("\nBest Threshold (F1-optimized): {:.4f}".format(thr))
-
-
-
     # # ------------------------------
     # # 2. Testing/Evaluation phase
     # # ------------------------------
@@ -287,19 +265,20 @@ def main_worker(gpu, args):
     #         all_paths.extend(filenames)
 
     # A_final = np.array(A_final)
+
     # # --- Step 2: Best threshold ---
     # # best_thr = return_best_thr(all_labels, all_scores)
     # # best_thr = return_best_thr(all_labels, A_final)
     # # print(f"Best threshold (F1-optimized): {best_thr:.4f}")
 
     # # ======================================================================
-    # # ISIC2018: SAVE CSVs + FULL MISCLASSIFICATION SUMMARY
+    # # LGG: SAVE CSVs + FULL MISCLASSIFICATION SUMMARY
     # # ======================================================================
 
     # test_dir = os.path.join(args.data_dir, "test")
     # label_map = {0: "NORMAL", 1: "ABNORMAL"}
 
-    # mis_dir = "misclassified_isic2018"
+    # mis_dir = "misclassified_lgg"
     # os.makedirs(mis_dir, exist_ok=True)
 
     # # Subfolders for misclassification types
@@ -323,6 +302,7 @@ def main_worker(gpu, args):
     # #for i, (score, gt, fname) in enumerate(zip(all_scores, all_labels, all_paths), start=1):
     # for i, (score, gt, img_path) in enumerate(zip(A_final, all_labels_np, all_paths), start=1):
     #     fname = os.path.basename(img_path)
+
     #     pred = int(score >= best_thr)
     #     results.append([i, fname, gt, pred])
 
@@ -348,7 +328,7 @@ def main_worker(gpu, args):
 
     #         shutil.copy(src_path, dst)
 
-    # print("Confusion Matrix ISIC2018 (FINAL test phase):\n", confusion_matrix(all_labels_np, (A_final >= best_thr).astype(int)))
+    # print("Confusion Matrix LGG (FINAL test phase):\n", confusion_matrix(all_labels_np, (A_final >= best_thr).astype(int)))
 
 
 
@@ -357,14 +337,14 @@ def main_worker(gpu, args):
     # # ======================================================================
 
     # pd.DataFrame(results, columns=["S.No", "Filename", "GT", "Pred"]).to_csv(
-    #     "results_test_edc_isic2018.csv", index=False
+    #     "results_test_edc_lgg.csv", index=False
     # )
 
     # pd.DataFrame(misclassified, columns=["S.No", "Filename", "GT", "Pred"]).to_csv(
-    #     "misclassified_test_edc_isic2018.csv", index=False
+    #     "misclassified_test_edc_lgg.csv", index=False
     # )
 
-    # print("\nSaved results_test_edc_isic2018.csv & misclassified_test_edc_isic2018.csv\n")
+    # print("\nSaved results_test_edc_lgg.csv & misclassified_test_edc_lgg.csv\n")
 
     # # ======================================================================
     # # BASIC SUMMARY
@@ -407,7 +387,7 @@ if __name__ == "__main__":
     '''
     parser.add_argument('--save_dir', type=str, default='./saved_models')
     parser.add_argument('-sn', '--save_name', type=str,
-                        default='edc_isic2018',
+                        default='edc_lgg',
                         )
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--load_path', type=str, default=None)
@@ -432,7 +412,7 @@ if __name__ == "__main__":
     '''
     parser.add_argument('--optim', type=str, default='AdamW')
     parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--lr_encoder', type=float, default=1e-5)
+    parser.add_argument('--lr_encoder', type=float, default=5e-5)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--amp', type=str2bool, default=False, help='use mixed precision training or not')
@@ -441,7 +421,7 @@ if __name__ == "__main__":
     Data Configurations
     '''
     parser.add_argument('--data_dir', type=str, default=DATASET_DIR)
-    parser.add_argument('-ds', '--dataset', type=str, default='skin')
+    parser.add_argument('-ds', '--dataset', type=str, default='lgg_mri')
     parser.add_argument('--train_sampler', type=str, default='RandomSampler')
     parser.add_argument('--img_size', type=int, default=256)
     parser.add_argument('--num_workers', type=int, default=4)

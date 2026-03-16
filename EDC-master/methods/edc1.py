@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import *
 from torch.cuda.amp import autocast, GradScaler
-from train_utils import Bn_Controller
+from helper_modules.train_utils import Bn_Controller
 from torch.autograd import Function
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -243,7 +243,7 @@ class EDC:
                 tb_dict['train/run_time'] = start_run.elapsed_time(end_run) / 1000.
 
             if (self.it + 1) % self.num_eval_iter == 0:
-                eval_dict = self.evaluate(args=args, device=device)
+                eval_dict = self.evaluate(args=args, device=device, save_visual=True)
 
                 # --- REMOVE non-scalar entries before TensorBoard ---
                 eval_dict_tb = eval_dict.copy()
@@ -343,9 +343,10 @@ class EDC:
                     anomaly_maps = F.interpolate(result['p_all'], size=xo.shape[1:3], mode='bilinear')
                     for i in range(xo.shape[0]):
                         image = xo[i].numpy().astype('uint8')
-                        anomaly_map = anomaly_maps[i].cpu().permute(1, 2, 0).numpy()
-
-                        file_name = file_names[i]
+                        # anomaly_map = anomaly_maps[i].cpu().permute(1, 2, 0).numpy()
+                        anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
+                        file_name = os.path.basename(file_names[i])
+                        #file_name = file_names[i]
                         self.save_anomaly_map(anomaly_map, image, save_path, file_name)
 
         y_true = np.array(y_true)
@@ -396,7 +397,19 @@ class EDC:
         hm_on_img = heatmap_on_image(heatmap, image)
 
         # save images
-        cv2.imwrite(os.path.join(save_path, file_name), hm_on_img)
+        base = os.path.splitext(file_name)[0]
+
+        # save overlay visualization
+        cv2.imwrite(
+            os.path.join(save_path, base + "_overlay.png"), 
+            hm_on_img
+            )
+
+        # save raw anomaly map for segementation
+        cv2.imwrite(
+            os.path.join(save_path, base + "_map.png"),
+            (anomaly_map_norm * 255).astype(np.uint8)
+            )
 
 
 def cvt2heatmap(gray):

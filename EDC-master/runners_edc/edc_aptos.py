@@ -1,5 +1,7 @@
 # import needed library
+import sys
 import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import logging
 import random
 
@@ -9,8 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
-from utils import get_logger, count_parameters, over_write_args_from_file
-from train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
+from helper_modules.utils import get_logger, count_parameters, over_write_args_from_file
+from helper_modules.train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
 from methods.edc1 import EDC
 import shutil
 from sklearn.metrics import confusion_matrix, classification_report

@@ -10,7 +10,7 @@ import os
 from copy import deepcopy
 from torch.optim.optimizer import Optimizer, required
 import copy
-from custom_writer import CustomWriter
+from helper_modules.custom_writer import CustomWriter
 from collections import Counter
 
 '''
