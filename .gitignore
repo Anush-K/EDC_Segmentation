@@ -19,6 +19,7 @@ __pycache__/
 moco_env/
 venv/
 env/
+edc_segment_env/
 
 # -------------------------
 # Datasets (DO NOT PUSH)
@@ -30,11 +31,12 @@ Br35H/
 LungCT/
 ODIR_v2/
 LGG_BrainMRI/
-
+LGG/
 # -------------------------
 # Training outputs
 # -------------------------
 saved_models/
+
 *.pth
 *.pt
 *.ckpt
