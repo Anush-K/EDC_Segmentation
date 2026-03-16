@@ -275,7 +275,7 @@ class EDC:
         pickle.dump(train_log, f_save)
         f_save.close()
 
-        eval_dict = self.evaluate(args=args, device=device, save_visual=False)
+        eval_dict = self.evaluate(args=args, device=device, save_visual=True)
         eval_dict.update({'eval/best_auc': best_eval_auc, 'eval/best_it': best_it})
         return eval_dict
 
