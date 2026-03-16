@@ -442,9 +442,7 @@ class EDC:
 
                 for i in range(xo.shape[0]):
 
-                    image = xo[i].cpu().numpy()
-                    image = np.transpose(image,(1,2,0))
-                    image = (image*255).astype(np.uint8)
+                    image = xo[i].cpu().numpy().astype(np.uint8)
 
                     anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
 
