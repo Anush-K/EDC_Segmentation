@@ -101,7 +101,7 @@ class EDC:
 
         # eval for once to verify if the checkpoint is loaded correctly
         if args.resume == True:
-            eval_dict = self.evaluate(args=args, device=device)
+            eval_dict = self.evaluate(device=device, args=args, save_visual=True)
             print(eval_dict)
 
         train_log = []
@@ -243,7 +243,7 @@ class EDC:
                 tb_dict['train/run_time'] = start_run.elapsed_time(end_run) / 1000.
 
             if (self.it + 1) % self.num_eval_iter == 0:
-                eval_dict = self.evaluate(args=args, device=device, save_visual=True)
+                eval_dict = self.evaluate(device=device, args=args, save_visual=True)
 
                 # --- REMOVE non-scalar entries before TensorBoard ---
                 eval_dict_tb = eval_dict.copy()
@@ -275,7 +275,7 @@ class EDC:
         pickle.dump(train_log, f_save)
         f_save.close()
 
-        eval_dict = self.evaluate(args=args, device=device, save_visual=True)
+        eval_dict = self.evaluate(device=device, args=args, save_visual=True)
         eval_dict.update({'eval/best_auc': best_eval_auc, 'eval/best_it': best_it})
         return eval_dict
 
@@ -342,7 +342,9 @@ class EDC:
                         os.mkdir(save_path)
                     anomaly_maps = F.interpolate(result['p_all'], size=xo.shape[1:3], mode='bilinear')
                     for i in range(xo.shape[0]):
-                        image = xo[i].numpy().astype('uint8')
+                        image = xo[i].cpu().numpy()
+                        image = np.transpose(image, (1,2,0))
+                        image = (image * 255).astype(np.uint8)
                         # anomaly_map = anomaly_maps[i].cpu().permute(1, 2, 0).numpy()
                         anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
                         file_name = os.path.basename(file_names[i])
