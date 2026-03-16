@@ -28,7 +28,8 @@ class LGGSegDataset(Dataset):
         image = image.astype(np.float32) / 255.0
         image = image.transpose(2,0,1)
 
-        mask_name = name.replace(".tif","_mask.tif")
+        # mask_name = name.replace(".tif","_mask.tif")
+        mask_name = name #heatmaps/mask would be of form TCGA_CS_4942_19970222_11.tif and not *_mask.tif because of this line
         mask = cv2.imread(os.path.join(self.mask_dir, mask_name),0)
         mask = cv2.resize(mask,(256,256))
         mask = (mask > 0).astype(np.float32)
