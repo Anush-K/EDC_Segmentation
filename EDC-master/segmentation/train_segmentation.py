@@ -44,6 +44,20 @@ def iou_score(pred, target):
 
     return (intersection + 1e-8) / (union + 1e-8)
 
+# ---------------------------
+# Dice loss
+# ---------------------------
+def dice_loss(pred, target):
+
+    smooth = 1e-8
+
+    intersection = (pred * target).sum()
+
+    dice = (2. * intersection + smooth) / (
+        pred.sum() + target.sum() + smooth
+    )
+
+    return 1 - dice
 
 # ---------------------------
 # Training loop
@@ -125,7 +139,12 @@ def run_experiment(use_heatmap):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    criterion = nn.BCELoss()
+    #criterion = nn.BCELoss()
+
+    bce = nn.BCELoss()
+
+    def criterion(pred, target):
+        return bce(pred, target) + dice_loss(pred, target)
 
     for epoch in range(EPOCHS):
 
