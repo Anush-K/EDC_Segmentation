@@ -12,7 +12,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 DATASET_PATH = "../LGG_SEG"
 BATCH_SIZE = 8
-EPOCHS = 30
+EPOCHS = 50
 LR = 1e-4
 
 
