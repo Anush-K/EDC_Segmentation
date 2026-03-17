@@ -44,7 +44,7 @@ class LGGSegDataset(Dataset):
             heatmap = cv2.resize(heatmap,(256,256))
             heatmap = heatmap.astype(np.float32)/255.0
             #heatmap = heatmap * 0.5
-            heatmap = heatmap * 1.0
+            heatmap = heatmap * 0.3
             heatmap = np.expand_dims(heatmap,0)
 
             image = np.concatenate([image,heatmap],axis=0)
