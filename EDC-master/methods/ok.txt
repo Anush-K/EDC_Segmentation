@@ -1,0 +1,289 @@
+Here is the **complete pipeline**, including **EDC classification + segmentation**, written step-by-step without interpretation.
+More than the explanation rely perfectly on the code as that is definitely single point of true explanation of what is exactly done in the project. this explanatin is just to give an overview.
+---
+
+# 🔹 STEP 1: Input Data
+
+* MRI image loaded from `images/`
+* Ground truth label:
+
+  * 0 → normal
+  * 1 → abnormal
+* Ground truth mask loaded from `masks/` (for segmentation)
+* All images:
+
+  * resized to `(256, 256)`
+  * normalized to `[0,1]`
+  * converted to tensor (CHW)
+
+---
+
+# 🔹 STEP 2: EDC Model (Anomaly Detection + Classification)
+
+## 🔸 Input
+
+* MRI image (3-channel)
+
+---
+
+## 🔸 Forward Pass
+
+Model outputs:
+
+* feature maps: `e1, e2, e3`
+* reconstructed features: `d1, d2, d3`
+* anomaly maps:
+
+  * `p1, p2, p3`
+  * combined map: `p_all`
+* loss:
+
+  * cosine similarity loss between encoder and decoder features
+
+---
+
+## 🔸 Anomaly Map Generation
+
+For each image:
+
+* `p_all` is:
+
+  * upsampled to match image size
+  * normalized using min-max scaling
+
+---
+
+## 🔸 Image-level Score (Classification)
+
+From anomaly map:
+
+p_img = max(p_all)   OR   mean(p_all)
+```
+
+* gives a scalar anomaly score per image
+
+---
+
+## 🔸 Prediction
+
+* threshold selected using precision-recall curve (best F1)
+* classification:
+
+
+if p_img >= threshold → abnormal
+else → normal
+```
+
+---
+
+## 🔸 Metrics Computed
+
+* AUC
+* Accuracy
+* F1-score
+* Recall
+* Specificity
+
+---
+
+## 🔸 Heatmap Saving
+
+For each image:
+
+* normalized anomaly map saved as:
+
+  * `*_map.png` (grayscale)
+* overlay saved as:
+
+  * `*_overlay.png`
+
+---
+
+# 🔹 STEP 3: Heatmap Usage
+
+Generated anomaly maps are used as:
+
+* input feature (Approach 2)
+* pseudo ground truth (Approach 3)
+
+---
+
+# 🔹 STEP 4: Dataset Construction (Segmentation)
+
+Dataset split (Taken only abnormal for segmentation as normal has no meaningful info in masks):
+
+* 80% training
+* 20% testing
+
+---
+
+## 🔸 Approach 1 (Baseline)
+
+* Input: image (3 channels)
+* Target: real mask
+
+---
+
+## 🔸 Approach 2 (Heatmap Guided)
+
+* Input:
+
+  * image (3 channels)
+  * heatmap (1 channel)
+    → concatenated → 4 channels
+* Target: real mask
+
+---
+
+## 🔸 Approach 3 (Pseudo-label)
+
+* Input: image (3 channels)
+* Target: heatmap used as mask
+
+---
+
+# 🔹 STEP 5: Segmentation Model
+
+* Model: UNet
+* Input channels:
+
+  * 3 or 4
+* Output:
+
+  * 1 channel
+  * sigmoid activation
+
+---
+
+# 🔹 STEP 6: Training
+
+For each batch:
+
+* forward:
+
+  ```id="8v8r1v"
+  pred = model(x)
+  ```
+* loss:
+
+  ```id="2mqkcf"
+  loss = BCE(pred, target) + DiceLoss(pred, target)
+  ```
+* backward:
+
+  * gradient computation
+  * optimizer step (Adam)
+
+---
+
+# 🔹 STEP 7: Evaluation
+
+For each test batch:
+
+* prediction:
+
+  ```id="l7lqhe"
+  pred = model(x)
+  pred_bin = (pred > 0.5)
+  ```
+* compute:
+
+  * Dice score
+  * IoU score
+
+---
+
+# 🔹 STEP 8: Result Collection
+
+For each sample:
+
+* store:
+
+  * image
+  * prediction mask
+  * ground truth mask (real or pseudo)
+  * Dice
+  * IoU
+
+* sort all samples by Dice (descending)
+
+---
+
+# 🔹 STEP 9: Sample Selection
+
+From sorted results:
+
+* select 1 sample from top 3
+* select 1 sample from middle 3
+* select 1 sample from bottom 3
+
+---
+
+# 🔹 STEP 10: Grid Visualization
+
+## 🔸 Approach 1
+
+Image | Prediction | Ground Truth
+```
+
+---
+
+## 🔸 Approach 2
+
+Image | Heatmap | Prediction | Ground Truth
+```
+
+---
+
+## 🔸 Approach 3
+
+
+Image | Prediction | Pseudo Ground Truth (heatmap)
+```
+
+---
+
+# 🔹 STEP 11: Save Outputs
+
+For each approach:
+
+* save:
+
+  ```
+  sample_0.png (top)
+  sample_1.png (middle)
+  sample_2.png (bottom)
+  ```
+
+Each image contains:
+
+* panels (as defined above)
+* Dice and IoU printed
+
+---
+
+# 🔹 FINAL FLOW SUMMARY
+
+
+Image
+ → EDC model
+    → anomaly maps (p1, p2, p3, p_all)
+    → image-level score (classification)
+    → heatmap saved
+
+ → Segmentation dataset (3 approaches)
+
+ → UNet training
+
+ → Prediction
+
+ → Metric computation
+
+ → Sorting (by Dice)
+
+ → Sample selection (top/mid/low)
+
+ → Grid visualization
+
+ → Save results
+```

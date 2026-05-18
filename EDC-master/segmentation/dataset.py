@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 
 class LGGSegDataset(Dataset):
 
-    def __init__(self, root, use_heatmap=False):
+    def __init__(self, root, use_heatmap=False, use_pseudo=False):
 
         self.image_dir = os.path.join(root, "images")
         self.heatmap_dir = os.path.join(root, "heatmaps")
@@ -14,6 +14,7 @@ class LGGSegDataset(Dataset):
 
         self.files = sorted(os.listdir(self.image_dir))
         self.use_heatmap = use_heatmap
+        self.use_pseudo = use_pseudo
 
     def __len__(self):
         return len(self.files)
@@ -27,12 +28,26 @@ class LGGSegDataset(Dataset):
 
         image = image.astype(np.float32) / 255.0
         image = image.transpose(2,0,1)
+        if self.use_pseudo:
+            heatmap = cv2.imread(
+                os.path.join(self.heatmap_dir, name.replace(".tif",".png")),
+                0    
+                )
 
-        # mask_name = name.replace(".tif","_mask.tif")
-        mask_name = name #heatmaps/mask would be of form TCGA_CS_4942_19970222_11.tif and not *_mask.tif because of this line
-        mask = cv2.imread(os.path.join(self.mask_dir, mask_name),0)
-        mask = cv2.resize(mask,(256,256))
-        mask = (mask > 0).astype(np.float32)
+            heatmap = cv2.resize(heatmap,(256,256))
+            heatmap = heatmap.astype(np.float32)/255.0
+
+            # OPTION A (recommended): soft labels - continous
+            #mask = heatmap
+
+            # OPTION B (try later): - Binary
+            mask = (heatmap > 0.6).astype(np.float32)
+        else:
+            # mask_name = name.replace(".tif","_mask.tif")
+            mask_name = name #heatmaps/mask would be of form TCGA_CS_4942_19970222_11.tif and not *_mask.tif because of this line
+            mask = cv2.imread(os.path.join(self.mask_dir, mask_name),0)
+            mask = cv2.resize(mask,(256,256))
+            mask = (mask > 0).astype(np.float32)
 
         if self.use_heatmap:
 

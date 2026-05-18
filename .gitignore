@@ -37,6 +37,9 @@ LGG_SEG/
 # Training outputs
 # -------------------------
 saved_models/
+outputs/
+outputs_1/
+outputs_claude/
 
 *.pth
 *.pt
@@ -50,7 +53,11 @@ saved_models/
 *.tar.gz
 
 # -------------------------
-# Extra Python files
+# Extra Python files and folders
 # -------------------------
 MoCo_1DatasetPretrain_tSNE.py
 MoCo_5DatasetPretrain_tSNE.py
+ISIC2018_original
+EDC-master/datasets/BUSI
+EDC-master/datasets/BUSI_Orig
+EDC-master/datasets/BUSI_SEG
