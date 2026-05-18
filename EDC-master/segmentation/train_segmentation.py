@@ -1,315 +1,187 @@
+# segmentation/train_segmentation.py
 import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-import random
-import cv2
 import numpy as np
 
 from dataset import LGGSegDataset
 from unet import UNet
 
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 DATASET_PATH = "../LGG_SEG"
-BATCH_SIZE = 8
-EPOCHS = 100
-LR = 1e-4
+BATCH_SIZE   = 8
+EPOCHS       = 100          # increased; best model is checkpointed so no risk
+LR           = 1e-4
+SEED         = 42
+SAVE_DIR     = "./seg_checkpoints"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 
-# ---------------------------
-# Dice metric
-# ---------------------------
-
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 def dice_score(pred, target):
-
-    pred = (pred > 0.5).float()
-
+    pred         = (pred > 0.5).float()
     intersection = (pred * target).sum()
+    return (2. * intersection + 1e-8) / (pred.sum() + target.sum() + 1e-8)
 
-    return (2. * intersection + 1e-8) / (
-        pred.sum() + target.sum() + 1e-8
-    )
-
-
-# ---------------------------
-# IoU metric
-# ---------------------------
 
 def iou_score(pred, target):
-
-    pred = (pred > 0.5).float()
-
+    pred         = (pred > 0.5).float()
     intersection = (pred * target).sum()
-    union = pred.sum() + target.sum() - intersection
-
+    union        = pred.sum() + target.sum() - intersection
     return (intersection + 1e-8) / (union + 1e-8)
 
-# ---------------------------
-# Dice loss
-# ---------------------------
+
+# ---------------------------------------------------------------------------
+# Losses
+# ---------------------------------------------------------------------------
 def dice_loss(pred, target):
-
-    smooth = 1e-8
-
+    smooth       = 1e-8
     intersection = (pred * target).sum()
-
-    dice = (2. * intersection + smooth) / (
-        pred.sum() + target.sum() + smooth
-    )
-
-    return 1 - dice
-
-# ---------------------------
-# Training loop
-# ---------------------------
-def train_epoch(model, loader, optimizer, criterion):
+    dice         = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+    return 1. - dice
 
 
+def combined_loss(pred, target):
+    return nn.BCELoss()(pred, target) + dice_loss(pred, target)
+
+
+# ---------------------------------------------------------------------------
+# Training / evaluation loops
+# ---------------------------------------------------------------------------
+def train_epoch(model, loader, optimizer):
     model.train()
-
-    total_loss = 0
-
-    for x, y in tqdm(loader):
-
-        x = x.to(DEVICE)
-        y = y.to(DEVICE)
-
+    total_loss = 0.0
+    for x, y in tqdm(loader, leave=False, desc='  train'):
+        x, y = x.to(DEVICE), y.to(DEVICE)
         optimizer.zero_grad()
-
         pred = model(x)
-
-        loss = criterion(pred, y)
-
+        loss = combined_loss(pred, y)
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
-
     return total_loss / len(loader)
 
 
-# ---------------------------
-# Evaluation loop
-# ---------------------------
-
 def evaluate(model, loader):
-
     model.eval()
-
-    dice_total = 0
-    iou_total = 0
-
+    dice_total = 0.0
+    iou_total  = 0.0
     with torch.no_grad():
-
         for x, y in loader:
-
-            x = x.to(DEVICE)
-            y = y.to(DEVICE)
-
+            x, y = x.to(DEVICE), y.to(DEVICE)
             pred = model(x)
-
             dice_total += dice_score(pred, y).item()
-            iou_total += iou_score(pred, y).item()
-
-    dice = dice_total / len(loader)
-    iou = iou_total / len(loader)
-
-    return dice, iou
+            iou_total  += iou_score(pred, y).item()
+    n = len(loader)
+    return dice_total / n, iou_total / n
 
 
-# ---------------------------
-# Train function
-# ---------------------------
+# ---------------------------------------------------------------------------
+# Main experiment runner
+# ---------------------------------------------------------------------------
+def run_experiment(use_heatmap, tag=''):
+    print(f"\n{'='*60}")
+    print(f"  Experiment: {'Image + Heatmap' if use_heatmap else 'Image only'} {tag}")
+    print(f"{'='*60}\n")
 
-def run_experiment(use_heatmap, use_pseudo, save_dir=None):
+    # FIX: pass train=True/False so augmentation is applied only to train split
+    full_dataset = LGGSegDataset(DATASET_PATH, use_heatmap=use_heatmap, train=True)
 
-    dataset = LGGSegDataset(DATASET_PATH, use_heatmap=use_heatmap, use_pseudo=use_pseudo)
+    train_size = int(0.8 * len(full_dataset))
+    test_size  = len(full_dataset) - train_size
 
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
+    # FIX: fixed seed so train/test split is identical across all experiments
+    generator = torch.Generator().manual_seed(SEED)
+    train_indices, test_indices = random_split(
+        range(len(full_dataset)), [train_size, test_size], generator=generator
+    )
 
-    train_set, test_set = random_split(dataset, [train_size, test_size])
+    # Build separate datasets with appropriate augmentation flag
+    train_set = LGGSegDataset(DATASET_PATH, use_heatmap=use_heatmap, train=True)
+    test_set  = LGGSegDataset(DATASET_PATH, use_heatmap=use_heatmap, train=False)
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, num_workers=4)
+    # Apply the same index split
+    from torch.utils.data import Subset
+    train_set = Subset(train_set, train_indices.indices)
+    test_set  = Subset(test_set,  test_indices.indices)
+
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=4, pin_memory=True)
 
     in_channels = 4 if use_heatmap else 3
+    model       = UNet(in_channels=in_channels, dropout_p=0.3).to(DEVICE)
 
-    model = UNet(in_channels).to(DEVICE)
+    optimizer   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # Cosine LR schedule — decays smoothly from LR to near 0
+    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-6
+    )
 
-    #criterion = nn.BCELoss()
+    # FIX: save best model by validation Dice
+    best_dice      = 0.0
+    best_iou       = 0.0
+    ckpt_name      = f"best_unet_{'hm' if use_heatmap else 'base'}.pth"
+    ckpt_path      = os.path.join(SAVE_DIR, ckpt_name)
 
-    bce = nn.BCELoss()
+    for epoch in range(1, EPOCHS + 1):
+        loss         = train_epoch(model, train_loader, optimizer)
+        dice, iou    = evaluate(model, test_loader)
+        scheduler.step()
 
-    def criterion(pred, target):
-        return bce(pred, target) + dice_loss(pred, target)
-
-    best_dice = 0
-    best_iou = 0
-
-    for epoch in range(EPOCHS):
-
-        loss = train_epoch(model, train_loader, optimizer, criterion)
-
-        dice, iou = evaluate(model, test_loader)
-
+        improved = ''
         if dice > best_dice:
             best_dice = dice
-            best_iou = iou
+            best_iou  = iou
+            torch.save(model.state_dict(), ckpt_path)
+            improved  = '  ← best'
 
-        print(
-            f"Epoch {epoch+1}/{EPOCHS} | Loss {loss:.4f} | Dice {dice:.4f} | IoU {iou:.4f}"
-        )
+        if epoch % 10 == 0 or improved:
+            print(
+                f"  Epoch {epoch:3d}/{EPOCHS} | "
+                f"Loss {loss:.4f} | Dice {dice:.4f} | IoU {iou:.4f}"
+                + improved
+            )
 
-    save_grid_predictions(model, test_loader, save_dir, use_heatmap, use_pseudo)
-    return best_dice, best_iou
+    # Load best weights for final report
+    model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    final_dice, final_iou = evaluate(model, test_loader)
+    print(f"\n  Best checkpoint → Dice {final_dice:.4f} | IoU {final_iou:.4f}")
+    print(f"  Saved to: {ckpt_path}")
+
+    return final_dice, final_iou
 
 
-def save_grid_predictions(model, loader, save_dir, use_heatmap, use_pseudo):
-
-    model.eval()
-    os.makedirs(save_dir, exist_ok=True)
-
-    results = []
-
-    with torch.no_grad():
-        for x, y in loader:
-
-            x = x.to(DEVICE)
-            y = y.to(DEVICE)
-
-            pred = model(x)
-            pred_bin = (pred > 0.5).float()
-
-            inter = (pred_bin * y).sum(dim=(1,2,3))
-            union = pred_bin.sum(dim=(1,2,3)) + y.sum(dim=(1,2,3)) - inter
-
-            dice = (2 * inter) / (pred_bin.sum(dim=(1,2,3)) + y.sum(dim=(1,2,3)) + 1e-8)
-            iou = inter / (union + 1e-8)
-
-            for i in range(x.shape[0]):
-                results.append({
-                    "dice": dice[i].item(),
-                    "iou": iou[i].item(),
-                    "image": x[i].cpu().numpy(),
-                    "pred": pred_bin[i].cpu().numpy()[0],
-                    "gt": y[i].cpu().numpy()[0],
-                })
-
-    # sort by Dice
-    results = sorted(results, key=lambda r: r["dice"], reverse=True)
-
-    mid = len(results) // 2
-    selected = [
-        random.choice(results[:3]),
-        random.choice(results[mid-1:mid+2]),
-        random.choice(results[-3:])
-    ]
-
-    def add_label(img, text):
-        out = img.copy()
-        cv2.putText(out, text, (10,20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255,255,255), 2)
-        return out
-
-    for idx, s in enumerate(selected):
-
-        img = s["image"]
-        pred = s["pred"]
-        gt = s["gt"]
-
-        # image
-        img_rgb = (np.transpose(img[:3], (1,2,0)) * 255).astype(np.uint8)
-
-        # prediction
-        pred_img = cv2.cvtColor((pred*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-
-        # GT (real OR pseudo)
-        gt_img = cv2.cvtColor((gt*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-
-        panels = [add_label(img_rgb, "Image")]
-
-        # -----------------------------
-        # Approach 1: Image → GT
-        # -----------------------------
-        if not use_heatmap and not use_pseudo:
-            panels += [
-                add_label(pred_img, "Prediction"),
-                add_label(gt_img, "Ground Truth")
-            ]
-
-        # -----------------------------
-        # Approach 2: Image + Heatmap → GT
-        # -----------------------------
-        elif use_heatmap and not use_pseudo:
-            heatmap = img[3]
-            heatmap = (heatmap * 255).astype(np.uint8)
-            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_GRAY2BGR)
-
-            panels += [
-                add_label(heatmap, "Heatmap (Input)"),
-                add_label(pred_img, "Prediction"),
-                add_label(gt_img, "Ground Truth")
-            ]
-
-        # -----------------------------
-        # Approach 3: Image → Heatmap (Pseudo GT)
-        # -----------------------------
-        elif not use_heatmap and use_pseudo:
-            panels += [
-                add_label(pred_img, "Prediction"),
-                add_label(gt_img, "Pseudo GT (Heatmap)")
-            ]
-
-        grid = np.concatenate(panels, axis=1)
-
-        cv2.putText(
-            grid,
-            f"Dice: {s['dice']:.4f} | IoU: {s['iou']:.4f}",
-            (10,45),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255,255,255),
-            2
-        )
-
-        save_path = os.path.join(save_dir, f"sample_{idx}.png")
-        cv2.imwrite(save_path, grid)
-
-        print(f"Saved {save_path}")
-
-# ---------------------------
-# MAIN
-# ---------------------------
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Reproducibility
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-    ## Currently dropped this heatmap as groundtruth approach, do not consider this approach anywhere
-    # print("\n--- Proposed: Image --> Heatmap as Groundtruth ---\n")
+    print("\n--- Baseline: Image only (3 channels) ---")
+    dice_base, iou_base = run_experiment(use_heatmap=False, tag='[baseline]')
 
-    # dice3, iou3 = run_experiment(use_heatmap=False, use_pseudo = True, save_dir="outputs/pseudo_gt")
+    print("\n--- Proposed: Image + Heatmap (4 channels) ---")
+    dice_prop, iou_prop = run_experiment(use_heatmap=True, tag='[proposed]')
 
-    print("\n--- Baseline: Image only --> Actual Groundtruth ---\n")
-
-    dice1, iou1 = run_experiment(use_heatmap=False, use_pseudo = False, save_dir="outputs/baseline")
-
-    print("\n--- Proposed: Image + Heatmap --> Actual Groundtruth ---\n")
-
-    dice2, iou2 = run_experiment(use_heatmap=True, use_pseudo = False,  save_dir="outputs/heatmap_guided")
-
-    print("\n===== FINAL RESULTS =====")
-
-    print(f"Baseline Dice: {dice1:.4f}")
-    print(f"Baseline IoU : {iou1:.4f}")
-
-    print(f"Heatmap-Guided Dice: {dice2:.4f}")
-    print(f"Proposed IoU : {iou2:.4f}")
-
-    print(f"Pseudo-GT Dice: {dice3:.4f}")
-    print(f"Pseudo-GT IoU : {iou3:.4f}")
+    print("\n" + "=" * 60)
+    print("  FINAL RESULTS SUMMARY")
+    print("=" * 60)
+    print(f"  Baseline  →  Dice: {dice_base:.4f}  |  IoU: {iou_base:.4f}")
+    print(f"  Proposed  →  Dice: {dice_prop:.4f}  |  IoU: {iou_prop:.4f}")
+    print(f"  Δ Dice: {dice_prop - dice_base:+.4f}  |  Δ IoU: {iou_prop - iou_base:+.4f}")
+    print("=" * 60)

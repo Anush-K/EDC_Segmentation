@@ -3,25 +3,29 @@ import os
 from collections import Counter
 from copy import deepcopy
 import pickle
-from unittest import result
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import *
+from sklearn.metrics import (
+    accuracy_score, f1_score, recall_score,
+    roc_auc_score, precision_recall_curve,
+    confusion_matrix, classification_report
+)
 from torch.cuda.amp import autocast, GradScaler
 from helper_modules.train_utils import Bn_Controller
-from torch.autograd import Function
+import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import cv2
-import time
 
 USE_CUDA = torch.cuda.is_available()
 USE_MPS = False
 
 
+# ---------------------------------------------------------------------------
+# Unified timer (works for CUDA, MPS, CPU)
+# ---------------------------------------------------------------------------
 class TimerEvent:
-    """Unified timing for CUDA and MPS (or CPU fallback)"""
     def __init__(self):
         self.start_time = None
         self.end_time = None
@@ -33,16 +37,23 @@ class TimerEvent:
         self.end_time = time.perf_counter()
 
     def elapsed_time(self, other_event):
-        """Return milliseconds like CUDA Event.elapsed_time()"""
+        """Return milliseconds, matching CUDA Event.elapsed_time() API."""
         return (other_event.end_time - self.start_time) * 1000
 
 
-
+# ---------------------------------------------------------------------------
+# EDC trainer / evaluator
+# ---------------------------------------------------------------------------
 class EDC:
-    def __init__(self, model, it=0, num_eval_iter=1000, amap_reduction='max', tb_log=None, logger=None):
-        """
-        """
-
+    def __init__(
+        self,
+        model,
+        it=0,
+        num_eval_iter=1000,
+        amap_reduction=0.1,   # FIX: was 'max'; top-10% mean is much more robust
+        tb_log=None,
+        logger=None,
+    ):
         super(EDC, self).__init__()
 
         self.loader = {}
@@ -50,21 +61,22 @@ class EDC:
 
         if USE_MPS:
             self.model = self.model.float()
-        
+
         self.num_eval_iter = num_eval_iter
         self.tb_log = tb_log
 
         self.optimizer = None
         self.scheduler = None
-        self.diffusion_optimizer = None
 
         self.it = 0
         self.logger = logger
         self.print_fn = print if logger is None else logger.info
-        self.amap_reduction = amap_reduction
+        self.amap_reduction = amap_reduction   # float → top-k%, 'mean', or 'max'
         self.bn_controller = Bn_Controller()
-        self.diffusion = None
 
+    # ------------------------------------------------------------------
+    # Setup helpers
+    # ------------------------------------------------------------------
     def set_data_loader(self, loader_dict):
         self.loader_dict = loader_dict
         self.print_fn(f'[!] data loader keys: {self.loader_dict.keys()}')
@@ -76,386 +88,352 @@ class EDC:
         self.optimizer = optimizer
         self.scheduler = scheduler
 
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
     def train(self, args, device, logger=None):
         self.model.train()
 
-        # for gpu profiling
-        # for unified profiling
-        # for unified profiling
+        # FIX: define save_path locally so it is always available
+        save_path = os.path.join(args.save_dir, args.save_name)
+        os.makedirs(save_path, exist_ok=True)
+
+        # Unified profiling timers
         if USE_MPS:
             start_batch = TimerEvent()
-            end_batch = TimerEvent()
-            start_run = TimerEvent()
-            end_run = TimerEvent()
+            end_batch   = TimerEvent()
+            start_run   = TimerEvent()
+            end_run     = TimerEvent()
         else:
             start_batch = torch.cuda.Event(enable_timing=True)
-            end_batch = torch.cuda.Event(enable_timing=True)
-            start_run = torch.cuda.Event(enable_timing=True)
-            end_run = torch.cuda.Event(enable_timing=True)
+            end_batch   = torch.cuda.Event(enable_timing=True)
+            start_run   = torch.cuda.Event(enable_timing=True)
+            end_run     = torch.cuda.Event(enable_timing=True)
 
         start_batch.record()
 
-        best_eval_auc, best_it = 0.0, 0
+        best_eval_auc = 0.0
+        best_it       = 0
         scaler = GradScaler()
-        amp_cm = autocast if args.amp else contextlib.nullcontext
 
-        # eval for once to verify if the checkpoint is loaded correctly
-        if args.resume == True:
+        # Evaluate from checkpoint if resuming
+        if args.resume:
             eval_dict = self.evaluate(device=device, args=args, save_visual=True)
-            print(eval_dict)
+            self.print_fn(eval_dict)
 
         train_log = []
 
         for idx, x, _, y, filename in tqdm(self.loader_dict['train']):
 
-            # prevent the training iterations exceed args.num_train_iter
+            # Stop at iteration limit
             if self.it > args.num_train_iter:
                 break
 
-            # --- end prefetch timing ---
+            # End prefetch timing
             if USE_MPS:
-                end_batch.end()        # mark end of prefetch
+                end_batch.end()
             else:
                 end_batch.record()
                 torch.cuda.synchronize()
-                
-            # --- start run timing ---
-            if USE_MPS:
-                start_run.record()
-            else:
-                start_run.record()
-            
+
+            # Start run timing
+            start_run.record()
+
             x = x.to(device)
             y = y.to(device, dtype=torch.float32)
             if USE_MPS:
-                x = x.float() 
+                x = x.float()
                 y = y.float()
 
-            if args.amp and not USE_MPS:
-                amp_cm = autocast
-            else:
-                amp_cm = contextlib.nullcontext 
+            # Choose AMP context
+            amp_cm = autocast if (args.amp and not USE_MPS) else contextlib.nullcontext
 
-            # with amp_cm():
-            #     result = self.model(x)
-
-            #     total_loss = result['loss'].mean()
-
-            # -------- EDC + Diffusion loss --------
-            # with amp_cm():
-            #     result = self.model(x)
-            #     edc_loss = result['loss'].mean()
-
-            #     # -------- Diffusion loss --------
-            #     e3 = self.model.edc_encoder(x)[2]  # e3 feature map
-            #     #diff_loss = self.diffusion.compute_loss(e3)
-            #     diff_loss = self.diffusion.compute_loss(e3.detach())
-            #     total_loss = edc_loss + args.lambda_diff * diff_loss
+            # ----------------------------------------------------------------
+            # Forward + loss  (FIX: removed dead diffusion encoder forward)
+            # ----------------------------------------------------------------
             with amp_cm():
-                result = self.model(x)
-                edc_loss = result['loss'].mean()
+                result    = self.model(x)
+                edc_loss  = result['loss'].mean()
+                total_loss = edc_loss
 
-                e3 = self.model.edc_encoder(x)[2]
-                # #normalize e3 for stable diffusion training
-                # #e3 = torch.nn.functional.normalize(e3, dim=1)
-                # Normalize ONLY for diffusion
-                e3_norm = torch.nn.functional.normalize(e3, dim=1)
-
-
-
-                if self.diffusion is not None:
-                    #diff_loss = self.diffusion.compute_loss(e3.detach())
-                    diff_loss = self.diffusion.compute_loss(e3_norm.detach())
-                    total_loss = edc_loss + args.lambda_diff * diff_loss
-                else:
-                    diff_loss = torch.tensor(0.0, device=device)
-                    total_loss = edc_loss
-
-            
-            # parameter updates
-            if args.amp:
+            # ----------------------------------------------------------------
+            # Backward
+            # ----------------------------------------------------------------
+            if args.amp and not USE_MPS:
                 scaler.scale(total_loss).backward()
                 if args.clip > 0:
                     scaler.unscale_(self.optimizer)
-                    total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
                 scaler.step(self.optimizer)
                 scaler.update()
+                self.optimizer.zero_grad()
             else:
-                # -------------------------
-                # Backprop EDC
-                # -------------------------
                 self.optimizer.zero_grad()
                 edc_loss.backward()
-
                 if args.clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
-
                 self.optimizer.step()
 
-                # -------------------------
-                # Backprop Diffusion
-                # -------------------------
-                if self.diffusion is not None:
-                    self.diffusion_optimizer.zero_grad()
-                    diff_loss.backward()
+            self.scheduler.step()
 
-                    torch.nn.utils.clip_grad_norm_(self.diffusion.parameters(), 1.0)
-
-                    self.diffusion_optimizer.step()
-
-                    self.diffusion.update_ema()
-
-                # Step scheduler for EDC only
-                self.scheduler.step()
-
-
-
-            # # ADD: update EMA for diffusion UNet
-            # if hasattr(self, "diffusion") and hasattr(self.diffusion, "update_ema"):
-            #     self.diffusion.update_ema()
-
-            # self.scheduler.step()
-            # self.model.zero_grad()
-
-            # --- end run timing ---
+            # End run timing
             if USE_MPS:
                 end_run.end()
             else:
                 end_run.record()
                 torch.cuda.synchronize()
-            # tensorboard_dict update
-            tb_dict = {}
-            tb_dict['train/total_loss'] = total_loss.detach().item()
-            tb_dict['train/edc_loss'] = edc_loss.detach().item()
-            tb_dict['train/diff_loss'] = (diff_loss.detach().item() if self.diffusion is not None else 0.0)
-            tb_dict['train/e1_std'] = result['e1_std'].detach().item()
-            tb_dict['train/e2_std'] = result['e2_std'].detach().item()
-            tb_dict['train/e3_std'] = result['e3_std'].detach().item()
 
-            tb_dict['lr'] = self.optimizer.param_groups[0]['lr']
-            
-            # --- tensorboard timing ---
-            if USE_MPS:
-                tb_dict['train/prefecth_time'] = start_batch.elapsed_time(end_batch) / 1000.
-                tb_dict['train/run_time'] = start_run.elapsed_time(end_run) / 1000.
-            else:
-                tb_dict['train/prefecth_time'] = start_batch.elapsed_time(end_batch) / 1000.
-                tb_dict['train/run_time'] = start_run.elapsed_time(end_run) / 1000.
+            # TensorBoard dict
+            tb_dict = {
+                'train/total_loss':    total_loss.detach().item(),
+                'train/edc_loss':      edc_loss.detach().item(),
+                'train/e1_std':        result['e1_std'].detach().item(),
+                'train/e2_std':        result['e2_std'].detach().item(),
+                'train/e3_std':        result['e3_std'].detach().item(),
+                'lr':                  self.optimizer.param_groups[0]['lr'],
+                'train/prefetch_time': start_batch.elapsed_time(end_batch) / 1000.,
+                'train/run_time':      start_run.elapsed_time(end_run) / 1000.,
+            }
 
+            # Periodic evaluation
             if (self.it + 1) % self.num_eval_iter == 0:
                 eval_dict = self.evaluate(device=device, args=args, save_visual=True)
 
-                # --- REMOVE non-scalar entries before TensorBoard ---
-                eval_dict_tb = eval_dict.copy()
-                eval_dict_tb.pop('eval/y_true', None)
-                eval_dict_tb.pop('eval/y_score', None)
-
+                # Strip non-scalar entries before logging
+                eval_dict_tb = {
+                    k: v for k, v in eval_dict.items()
+                    if k not in ('eval/y_true', 'eval/y_score')
+                }
                 tb_dict.update(eval_dict_tb)
 
-                save_path = os.path.join(args.save_dir, args.save_name)
-
+                # FIX: save best model checkpoint
                 if tb_dict['eval/AUC'] > best_eval_auc:
                     best_eval_auc = tb_dict['eval/AUC']
-                    best_it = self.it
+                    best_it       = self.it
+                    self.save_model('model_best.pth', save_path)
+                    self.print_fn(f"  → New best AUC: {best_eval_auc:.4f} — checkpoint saved.")
 
                 self.print_fn(
-                    f"{self.it} iteration, {tb_dict}, BEST_EVAL_AUC: {best_eval_auc}, at {best_it} iters")
+                    f"Iter {self.it} | {tb_dict} | BEST_AUC: {best_eval_auc:.4f} @ iter {best_it}"
+                )
 
                 if self.tb_log is not None:
                     self.tb_log.update(tb_dict, self.it)
 
-                    tb_dict['it'] = self.it
-                    train_log.append(tb_dict)
+                tb_dict['it'] = self.it
+                train_log.append(tb_dict)
 
             self.it += 1
             del tb_dict
             start_batch.record()
 
-        f_save = open(os.path.join(save_path, 'train_log.pkl'), 'wb')
-        pickle.dump(train_log, f_save)
-        f_save.close()
+        # Save training log
+        log_path = os.path.join(save_path, 'train_log.pkl')
+        with open(log_path, 'wb') as f:
+            pickle.dump(train_log, f)
 
+        # Final evaluation
         eval_dict = self.evaluate(device=device, args=args)
-        
-        print("Generating heatmaps...")
+
+        # FIX: generate heatmaps only once (caller must NOT call again)
+        self.print_fn("Generating heatmaps (ABNORMAL images only)...")
         self.generate_heatmaps(device, args)
+
         eval_dict.update({'eval/best_auc': best_eval_auc, 'eval/best_it': best_it})
         return eval_dict
 
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def evaluate(self, device, eval_loader=None, args=None, save_visual=False):
         self.model.eval()
         if eval_loader is None:
             eval_loader = self.loader_dict['eval']
-        total_num = 0.0
+
+        total_num  = 0.0
         total_loss = 0.0
-        y_true = []
-        y_prob = []
+        y_true  = []
+        y_prob  = []
         y1_prob = []
         y2_prob = []
         y3_prob = []
 
-        # with self.diffusion.ema_scope():
-        ema_cm = self.diffusion.ema_scope() if self.diffusion is not None else contextlib.nullcontext()
+        for _, x, xo, y, file_names in eval_loader:
+            x, y = x.to(device), y.to(device, dtype=torch.float32)
+            if USE_MPS:
+                x = x.float()
+                y = y.float()
 
-        with ema_cm:
-            for _, x, xo, y, file_names in eval_loader:
-                x, y = x.to(device), y.to(device, dtype=torch.float32)
-                if USE_MPS:
-                    x = x.float()
-                    y = y.float()
-                num_batch = x.shape[0]
-                total_num += num_batch
-                result = self.model(x)
-                if self.amap_reduction == 'mean':
-                    p_img = result['p_all'].flatten(1).mean(1)
-                    p1_img = result['p1'].flatten(1).mean(1)
-                    p2_img = result['p2'].flatten(1).mean(1)
-                    p3_img = result['p3'].flatten(1).mean(1)
-                elif isinstance(self.amap_reduction, float):  # the mean of max 'self.amap_reduction' percent
-                    anomaly_map = result['p_all'].flatten(1)
-                    p_img = torch.sort(anomaly_map, dim=1, descending=True)[0][:,
-                            :int(anomaly_map.shape[1] * self.amap_reduction)].mean(dim=1)
-                    anomaly_map = result['p1'].flatten(1)
-                    p1_img = torch.sort(anomaly_map, dim=1, descending=True)[0][:,
-                            :int(anomaly_map.shape[1] * self.amap_reduction)].mean(dim=1)
-                    anomaly_map = result['p2'].flatten(1)
-                    p2_img = torch.sort(anomaly_map, dim=1, descending=True)[0][:,
-                            :int(anomaly_map.shape[1] * self.amap_reduction)].mean(dim=1)
-                    anomaly_map = result['p3'].flatten(1)
-                    p3_img = torch.sort(anomaly_map, dim=1, descending=True)[0][:,
-                            :int(anomaly_map.shape[1] * self.amap_reduction)].mean(dim=1)
-                else:  # max
-                    p_img = result['p_all'].flatten(1).max(1)[0]
-                    p1_img = result['p1'].flatten(1).max(1)[0]
-                    p2_img = result['p2'].flatten(1).max(1)[0]
-                    p3_img = result['p3'].flatten(1).max(1)[0]
+            num_batch   = x.shape[0]
+            total_num  += num_batch
+            result      = self.model(x)
 
-                y_true.extend(y.cpu().tolist())
-                y_prob.extend(p_img.cpu().tolist())
-                y1_prob.extend(p1_img.cpu().tolist())
-                y2_prob.extend(p2_img.cpu().tolist())
-                y3_prob.extend(p3_img.cpu().tolist())
+            # ---- image-level anomaly score --------------------------------
+            p_img  = self._reduce_map(result['p_all'])
+            p1_img = self._reduce_map(result['p1'])
+            p2_img = self._reduce_map(result['p2'])
+            p3_img = self._reduce_map(result['p3'])
 
-                total_loss += result['loss'].detach().item() * num_batch
+            y_true.extend(y.cpu().tolist())
+            y_prob.extend(p_img.cpu().tolist())
+            y1_prob.extend(p1_img.cpu().tolist())
+            y2_prob.extend(p2_img.cpu().tolist())
+            y3_prob.extend(p3_img.cpu().tolist())
 
-                if save_visual:
-                    save_path = os.path.join(args.save_dir, args.save_name, 'heatmap')
-                    if not os.path.exists(save_path):
-                        os.mkdir(save_path)
-                    anomaly_maps = F.interpolate(result['p_all'], size=xo.shape[1:3], mode='bilinear')
-                    for i in range(xo.shape[0]):
-                        image = xo[i].cpu().numpy().astype(np.uint8)
-                        # anomaly_map = anomaly_maps[i].cpu().permute(1, 2, 0).numpy()
-                        anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
-                        file_name = os.path.basename(file_names[i])
-                        #file_name = file_names[i]
-                        self.save_anomaly_map(anomaly_map, image, save_path, file_name)
+            total_loss += result['loss'].detach().item() * num_batch
 
-        y_true = np.array(y_true)
-        y_prob = np.array(y_prob)
+            # ---- optional visual saving -----------------------------------
+            if save_visual and args is not None:
+                vis_path = os.path.join(args.save_dir, args.save_name, 'heatmap')
+                os.makedirs(vis_path, exist_ok=True)
+                anomaly_maps = F.interpolate(
+                    result['p_all'], size=xo.shape[1:3], mode='bilinear', align_corners=False
+                )
+                for i in range(xo.shape[0]):
+                    image      = xo[i].cpu().numpy().astype(np.uint8)
+                    amap       = anomaly_maps[i].cpu().squeeze().numpy()
+                    fname      = os.path.basename(file_names[i])
+                    self.save_anomaly_map(amap, image, vis_path, fname)
+
+        y_true  = np.array(y_true)
+        y_prob  = np.array(y_prob)
+        y1_prob = np.array(y1_prob)
+        y2_prob = np.array(y2_prob)
+        y3_prob = np.array(y3_prob)
 
         thresh = return_best_thr(y_true, y_prob)
         y_pred = (y_prob >= thresh).astype(int)
 
-        acc = accuracy_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred)
-        recall = recall_score(y_true, y_pred)
-        specificity = specificity_score(y_true, y_pred)
-
-        AUC = roc_auc_score(y_true, y_prob)
-        AUC1 = roc_auc_score(y_true, y1_prob)
-        AUC2 = roc_auc_score(y_true, y2_prob)
-        AUC3 = roc_auc_score(y_true, y3_prob)
+        acc         = accuracy_score(y_true, y_pred)
+        f1          = f1_score(y_true, y_pred, zero_division=0)
+        recall      = recall_score(y_true, y_pred, zero_division=0)
+        spec        = specificity_score(y_true, y_pred)
+        AUC         = roc_auc_score(y_true, y_prob)
+        AUC1        = roc_auc_score(y_true, y1_prob)
+        AUC2        = roc_auc_score(y_true, y2_prob)
+        AUC3        = roc_auc_score(y_true, y3_prob)
 
         self.model.train()
-        return {'eval/loss': total_loss / total_num, 'eval/f1': f1, 'eval/recall': recall,
-                'eval/specificity': specificity, 'eval/acc': acc,
-                'eval/AUC': AUC, 'eval/AUC1': AUC1, 'eval/AUC2': AUC2, 'eval/AUC3': AUC3,
-                'eval/best_thr': thresh, 'eval/y_true': y_true, 'eval/y_score': y_prob
-                }
+        return {
+            'eval/loss':        total_loss / total_num,
+            'eval/f1':          f1,
+            'eval/recall':      recall,
+            'eval/specificity': spec,
+            'eval/acc':         acc,
+            'eval/AUC':         AUC,
+            'eval/AUC1':        AUC1,
+            'eval/AUC2':        AUC2,
+            'eval/AUC3':        AUC3,
+            'eval/best_thr':    thresh,
+            'eval/y_true':      y_true,
+            'eval/y_score':     y_prob,
+        }
 
-    def save_model(self, save_name, save_path):
-        save_filename = os.path.join(save_path, save_name)
-        self.model.train()
-        torch.save({'model': self.model.state_dict()},
-                   save_filename)
-        self.print_fn(f"model saved: {save_filename}")
-
-    def load_model(self, load_path):
-        checkpoint = torch.load(load_path)
-
-        self.model.load_state_dict(checkpoint['model'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        self.it = checkpoint['it']
-        self.print_fn('model loaded')
-
-    def save_anomaly_map(self, anomaly_map, image, save_path, file_name):
-        # if anomaly_map.shape != image.shape:
-        #     anomaly_map = cv2.resize(anomaly_map, (image.shape[0], image.shape[1]))
-        anomaly_map_norm = min_max_norm(anomaly_map)
-        # anomaly map on image
-        heatmap = cvt2heatmap(anomaly_map_norm * 255)
-        hm_on_img = heatmap_on_image(heatmap, image)
-
-        # save images
-        base = os.path.splitext(file_name)[0]
-
-        # save overlay visualization
-        cv2.imwrite(
-            os.path.join(save_path, base + "_overlay.png"), 
-            hm_on_img
-            )
-
-        # save raw anomaly map for segementation
-        cv2.imwrite(
-            os.path.join(save_path, base + "_map.png"),
-            (anomaly_map_norm * 255).astype(np.uint8)
-            )
-
+    # ------------------------------------------------------------------
+    # Heatmap generation  (FIX: ABNORMAL only, called once)
+    # ------------------------------------------------------------------
     def generate_heatmaps(self, device, args):
-        print("Generating anomaly heatmaps...")
-
+        """Save anomaly heatmaps for ABNORMAL test images only."""
         self.model.eval()
-
-        save_path = os.path.join(args.save_dir, args.save_name, "heatmap")
+        save_path = os.path.join(args.save_dir, args.save_name, 'heatmap')
         os.makedirs(save_path, exist_ok=True)
 
         eval_loader = self.loader_dict['eval']
+        n_saved = 0
 
         with torch.no_grad():
-
-            for _, x, xo, y, file_names in tqdm(eval_loader):
-
+            for _, x, xo, y, file_names in tqdm(eval_loader, desc='Generating heatmaps'):
                 x = x.to(device)
-
                 result = self.model(x)
 
                 anomaly_maps = F.interpolate(
                     result['p_all'],
                     size=xo.shape[1:3],
-                    mode='bilinear'
+                    mode='bilinear',
+                    align_corners=False,
                 )
 
                 for i in range(xo.shape[0]):
+                    # FIX: only save heatmaps for ABNORMAL images (label == 1)
+                    label = int(y[i].item()) if torch.is_tensor(y[i]) else int(y[i])
+                    if label != 1:
+                        continue
 
-                    image = xo[i].cpu().numpy().astype(np.uint8)
+                    image    = xo[i].cpu().numpy().astype(np.uint8)
+                    amap     = anomaly_maps[i].cpu().squeeze().numpy()
+                    fname    = os.path.basename(file_names[i])
+                    self.save_anomaly_map(amap, image, save_path, fname)
+                    n_saved += 1
 
-                    anomaly_map = anomaly_maps[i].cpu().squeeze().numpy()
+        self.print_fn(f"Heatmaps saved for {n_saved} ABNORMAL images → {save_path}")
 
-                    file_name = os.path.basename(file_names[i])
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def save_model(self, save_name, save_path):
+        os.makedirs(save_path, exist_ok=True)
+        save_filename = os.path.join(save_path, save_name)
+        torch.save(
+            {
+                'model':     self.model.state_dict(),
+                'optimizer': self.optimizer.state_dict() if self.optimizer else None,
+                'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+                'it':        self.it,
+            },
+            save_filename,
+        )
+        self.print_fn(f"Checkpoint saved: {save_filename}")
 
-                    self.save_anomaly_map(
-                        anomaly_map,
-                        image,
-                        save_path,
-                        file_name
-                    )
+    def load_model(self, load_path):
+        checkpoint = torch.load(load_path, map_location='cpu')
+        self.model.load_state_dict(checkpoint['model'])
+        if self.optimizer and checkpoint.get('optimizer'):
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if self.scheduler and checkpoint.get('scheduler'):
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        self.it = checkpoint.get('it', 0)
+        self.print_fn(f"Model loaded from {load_path} (iter={self.it})")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _reduce_map(self, pmap):
+        """
+        Reduce a spatial anomaly map (B,1,H,W) to a per-image scalar.
+        Uses top-k% mean when self.amap_reduction is a float,
+        'mean' for global mean, 'max' for global max.
+        """
+        flat = pmap.flatten(1)                    # (B, H*W)
+        if isinstance(self.amap_reduction, float):
+            k = max(1, int(flat.shape[1] * self.amap_reduction))
+            return torch.sort(flat, dim=1, descending=True)[0][:, :k].mean(dim=1)
+        elif self.amap_reduction == 'mean':
+            return flat.mean(1)
+        else:                                     # 'max'
+            return flat.max(1)[0]
+
+    # ------------------------------------------------------------------
+    # Visualisation helpers
+    # ------------------------------------------------------------------
+    def save_anomaly_map(self, anomaly_map, image, save_path, file_name):
+        anomaly_map_norm = min_max_norm(anomaly_map)
+        heatmap    = cvt2heatmap(anomaly_map_norm * 255)
+        hm_on_img  = heatmap_on_image(heatmap, image)
+
+        base = os.path.splitext(file_name)[0]
+        cv2.imwrite(os.path.join(save_path, base + '_overlay.png'), hm_on_img)
+        cv2.imwrite(
+            os.path.join(save_path, base + '_map.png'),
+            (anomaly_map_norm * 255).astype(np.uint8),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 def cvt2heatmap(gray):
-    heatmap = cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
-    return heatmap
+    return cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
 
 
 def heatmap_on_image(heatmap, image):
@@ -466,27 +444,29 @@ def heatmap_on_image(heatmap, image):
 
 def min_max_norm(image):
     a_min, a_max = image.min(), image.max()
+    if a_max == a_min:          # guard against flat maps
+        return np.zeros_like(image)
     return (image - a_min) / (a_max - a_min)
 
 
 def return_best_thr(y_true, y_score):
     precs, recs, thrs = precision_recall_curve(y_true, y_score)
-
     f1s = 2 * precs * recs / (precs + recs + 1e-7)
     f1s = f1s[:-1]
-    thrs = thrs[~np.isnan(f1s)]
-    f1s = f1s[~np.isnan(f1s)]
-    best_thr = thrs[np.argmax(f1s)]
-    return best_thr
+    mask = ~np.isnan(f1s)
+    thrs = thrs[mask]
+    f1s  = f1s[mask]
+    if len(f1s) == 0:
+        return 0.5
+    return thrs[np.argmax(f1s)]
 
 
 def specificity_score(y_true, y_pred):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred).astype(int)
-
     TN = ((y_pred == 0) & (y_true == 0)).sum()
-    N = (y_true == 0).sum()
-    return TN / (N + 1e-8)
+    N  = (y_true == 0).sum()
+    return float(TN) / (N + 1e-8)
 
 
 if __name__ == "__main__":
