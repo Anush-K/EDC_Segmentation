@@ -1,7 +1,9 @@
+# methods/edc1.py
+# Updated to log RQASW scale weights (scale_w1/w2/w3) from edc.py every eval.
+# All other logic identical to the corrected version.
+
 import contextlib
 import os
-from collections import Counter
-from copy import deepcopy
 import pickle
 import numpy as np
 import torch
@@ -9,26 +11,24 @@ import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score, f1_score, recall_score,
     roc_auc_score, precision_recall_curve,
-    confusion_matrix, classification_report
 )
 from torch.cuda.amp import autocast, GradScaler
 from helper_modules.train_utils import Bn_Controller
 import time
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import cv2
 
 USE_CUDA = torch.cuda.is_available()
-USE_MPS = False
+USE_MPS  = False
 
 
 # ---------------------------------------------------------------------------
-# Unified timer (works for CUDA, MPS, CPU)
+# Unified timer
 # ---------------------------------------------------------------------------
 class TimerEvent:
     def __init__(self):
         self.start_time = None
-        self.end_time = None
+        self.end_time   = None
 
     def record(self):
         self.start_time = time.perf_counter()
@@ -36,9 +36,8 @@ class TimerEvent:
     def end(self):
         self.end_time = time.perf_counter()
 
-    def elapsed_time(self, other_event):
-        """Return milliseconds, matching CUDA Event.elapsed_time() API."""
-        return (other_event.end_time - self.start_time) * 1000
+    def elapsed_time(self, other):
+        return (other.end_time - self.start_time) * 1000   # ms
 
 
 # ---------------------------------------------------------------------------
@@ -50,32 +49,25 @@ class EDC:
         model,
         it=0,
         num_eval_iter=1000,
-        amap_reduction=0.1,   # FIX: was 'max'; top-10% mean is much more robust
+        amap_reduction=0.1,
         tb_log=None,
         logger=None,
     ):
-        super(EDC, self).__init__()
-
-        self.loader = {}
-        self.model = model
-
+        super().__init__()
+        self.model         = model
         if USE_MPS:
             self.model = self.model.float()
 
         self.num_eval_iter = num_eval_iter
-        self.tb_log = tb_log
+        self.tb_log        = tb_log
+        self.optimizer     = None
+        self.scheduler     = None
+        self.it            = 0
+        self.logger        = logger
+        self.print_fn      = print if logger is None else logger.info
+        self.amap_reduction = amap_reduction
+        self.bn_controller  = Bn_Controller()
 
-        self.optimizer = None
-        self.scheduler = None
-
-        self.it = 0
-        self.logger = logger
-        self.print_fn = print if logger is None else logger.info
-        self.amap_reduction = amap_reduction   # float → top-k%, 'mean', or 'max'
-        self.bn_controller = Bn_Controller()
-
-    # ------------------------------------------------------------------
-    # Setup helpers
     # ------------------------------------------------------------------
     def set_data_loader(self, loader_dict):
         self.loader_dict = loader_dict
@@ -94,16 +86,12 @@ class EDC:
     def train(self, args, device, logger=None):
         self.model.train()
 
-        # FIX: define save_path locally so it is always available
         save_path = os.path.join(args.save_dir, args.save_name)
         os.makedirs(save_path, exist_ok=True)
 
-        # Unified profiling timers
         if USE_MPS:
-            start_batch = TimerEvent()
-            end_batch   = TimerEvent()
-            start_run   = TimerEvent()
-            end_run     = TimerEvent()
+            start_batch = TimerEvent(); end_batch = TimerEvent()
+            start_run   = TimerEvent(); end_run   = TimerEvent()
         else:
             start_batch = torch.cuda.Event(enable_timing=True)
             end_batch   = torch.cuda.Event(enable_timing=True)
@@ -111,54 +99,40 @@ class EDC:
             end_run     = torch.cuda.Event(enable_timing=True)
 
         start_batch.record()
-
         best_eval_auc = 0.0
         best_it       = 0
-        scaler = GradScaler()
+        scaler        = GradScaler()
+        train_log     = []
 
-        # Evaluate from checkpoint if resuming
         if args.resume:
             eval_dict = self.evaluate(device=device, args=args, save_visual=True)
             self.print_fn(eval_dict)
 
-        train_log = []
-
         for idx, x, _, y, filename in tqdm(self.loader_dict['train']):
 
-            # Stop at iteration limit
             if self.it > args.num_train_iter:
                 break
 
-            # End prefetch timing
             if USE_MPS:
                 end_batch.end()
             else:
                 end_batch.record()
                 torch.cuda.synchronize()
 
-            # Start run timing
             start_run.record()
 
             x = x.to(device)
             y = y.to(device, dtype=torch.float32)
             if USE_MPS:
-                x = x.float()
-                y = y.float()
+                x, y = x.float(), y.float()
 
-            # Choose AMP context
             amp_cm = autocast if (args.amp and not USE_MPS) else contextlib.nullcontext
 
-            # ----------------------------------------------------------------
-            # Forward + loss  (FIX: removed dead diffusion encoder forward)
-            # ----------------------------------------------------------------
             with amp_cm():
-                result    = self.model(x)
-                edc_loss  = result['loss'].mean()
+                result     = self.model(x)
+                edc_loss   = result['loss'].mean()
                 total_loss = edc_loss
 
-            # ----------------------------------------------------------------
-            # Backward
-            # ----------------------------------------------------------------
             if args.amp and not USE_MPS:
                 scaler.scale(total_loss).backward()
                 if args.clip > 0:
@@ -176,45 +150,52 @@ class EDC:
 
             self.scheduler.step()
 
-            # End run timing
             if USE_MPS:
                 end_run.end()
             else:
                 end_run.record()
                 torch.cuda.synchronize()
 
-            # TensorBoard dict
             tb_dict = {
                 'train/total_loss':    total_loss.detach().item(),
                 'train/edc_loss':      edc_loss.detach().item(),
+                'train/recon_loss':    result['recon_loss'].detach().item(),
+                'train/var_loss':      result['var_loss'].detach().item(),
                 'train/e1_std':        result['e1_std'].detach().item(),
                 'train/e2_std':        result['e2_std'].detach().item(),
                 'train/e3_std':        result['e3_std'].detach().item(),
+                # RQASW: log current adaptive weights every iteration
+                'train/scale_w1':      result['scale_w1'].item(),
+                'train/scale_w2':      result['scale_w2'].item(),
+                'train/scale_w3':      result['scale_w3'].item(),
                 'lr':                  self.optimizer.param_groups[0]['lr'],
                 'train/prefetch_time': start_batch.elapsed_time(end_batch) / 1000.,
                 'train/run_time':      start_run.elapsed_time(end_run) / 1000.,
             }
 
-            # Periodic evaluation
             if (self.it + 1) % self.num_eval_iter == 0:
                 eval_dict = self.evaluate(device=device, args=args, save_visual=True)
 
-                # Strip non-scalar entries before logging
                 eval_dict_tb = {
                     k: v for k, v in eval_dict.items()
                     if k not in ('eval/y_true', 'eval/y_score')
                 }
                 tb_dict.update(eval_dict_tb)
 
-                # FIX: save best model checkpoint
                 if tb_dict['eval/AUC'] > best_eval_auc:
                     best_eval_auc = tb_dict['eval/AUC']
                     best_it       = self.it
                     self.save_model('model_best.pth', save_path)
-                    self.print_fn(f"  → New best AUC: {best_eval_auc:.4f} — checkpoint saved.")
+                    self.print_fn(f"  -> New best AUC: {best_eval_auc:.4f} — checkpoint saved.")
 
+                # Log final RQASW weights at each evaluation
                 self.print_fn(
-                    f"Iter {self.it} | {tb_dict} | BEST_AUC: {best_eval_auc:.4f} @ iter {best_it}"
+                    f"Iter {self.it} | AUC {tb_dict['eval/AUC']:.4f} | "
+                    f"RQASW w=["
+                    f"{tb_dict['train/scale_w1']:.3f}, "
+                    f"{tb_dict['train/scale_w2']:.3f}, "
+                    f"{tb_dict['train/scale_w3']:.3f}] | "
+                    f"BEST_AUC: {best_eval_auc:.4f} @ iter {best_it}"
                 )
 
                 if self.tb_log is not None:
@@ -227,15 +208,12 @@ class EDC:
             del tb_dict
             start_batch.record()
 
-        # Save training log
         log_path = os.path.join(save_path, 'train_log.pkl')
         with open(log_path, 'wb') as f:
             pickle.dump(train_log, f)
 
-        # Final evaluation
         eval_dict = self.evaluate(device=device, args=args)
 
-        # FIX: generate heatmaps only once (caller must NOT call again)
         self.print_fn("Generating heatmaps (ABNORMAL images only)...")
         self.generate_heatmaps(device, args)
 
@@ -253,23 +231,18 @@ class EDC:
 
         total_num  = 0.0
         total_loss = 0.0
-        y_true  = []
-        y_prob  = []
-        y1_prob = []
-        y2_prob = []
-        y3_prob = []
+        y_true, y_prob   = [], []
+        y1_prob, y2_prob, y3_prob = [], [], []
 
         for _, x, xo, y, file_names in eval_loader:
             x, y = x.to(device), y.to(device, dtype=torch.float32)
             if USE_MPS:
-                x = x.float()
-                y = y.float()
+                x, y = x.float(), y.float()
 
             num_batch   = x.shape[0]
             total_num  += num_batch
             result      = self.model(x)
 
-            # ---- image-level anomaly score --------------------------------
             p_img  = self._reduce_map(result['p_all'])
             p1_img = self._reduce_map(result['p1'])
             p2_img = self._reduce_map(result['p2'])
@@ -280,20 +253,19 @@ class EDC:
             y1_prob.extend(p1_img.cpu().tolist())
             y2_prob.extend(p2_img.cpu().tolist())
             y3_prob.extend(p3_img.cpu().tolist())
-
             total_loss += result['loss'].detach().item() * num_batch
 
-            # ---- optional visual saving -----------------------------------
             if save_visual and args is not None:
                 vis_path = os.path.join(args.save_dir, args.save_name, 'heatmap')
                 os.makedirs(vis_path, exist_ok=True)
                 anomaly_maps = F.interpolate(
-                    result['p_all'], size=xo.shape[1:3], mode='bilinear', align_corners=False
+                    result['p_all'], size=xo.shape[1:3],
+                    mode='bilinear', align_corners=False,
                 )
                 for i in range(xo.shape[0]):
-                    image      = xo[i].cpu().numpy().astype(np.uint8)
-                    amap       = anomaly_maps[i].cpu().squeeze().numpy()
-                    fname      = os.path.basename(file_names[i])
+                    image = xo[i].cpu().numpy().astype(np.uint8)
+                    amap  = anomaly_maps[i].cpu().squeeze().numpy()
+                    fname = os.path.basename(file_names[i])
                     self.save_anomaly_map(amap, image, vis_path, fname)
 
         y_true  = np.array(y_true)
@@ -305,14 +277,14 @@ class EDC:
         thresh = return_best_thr(y_true, y_prob)
         y_pred = (y_prob >= thresh).astype(int)
 
-        acc         = accuracy_score(y_true, y_pred)
-        f1          = f1_score(y_true, y_pred, zero_division=0)
-        recall      = recall_score(y_true, y_pred, zero_division=0)
-        spec        = specificity_score(y_true, y_pred)
-        AUC         = roc_auc_score(y_true, y_prob)
-        AUC1        = roc_auc_score(y_true, y1_prob)
-        AUC2        = roc_auc_score(y_true, y2_prob)
-        AUC3        = roc_auc_score(y_true, y3_prob)
+        acc    = accuracy_score(y_true, y_pred)
+        f1     = f1_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        spec   = specificity_score(y_true, y_pred)
+        AUC    = roc_auc_score(y_true, y_prob)
+        AUC1   = roc_auc_score(y_true, y1_prob)
+        AUC2   = roc_auc_score(y_true, y2_prob)
+        AUC3   = roc_auc_score(y_true, y3_prob)
 
         self.model.train()
         return {
@@ -331,59 +303,47 @@ class EDC:
         }
 
     # ------------------------------------------------------------------
-    # Heatmap generation  (FIX: ABNORMAL only, called once)
+    # Heatmap generation — ABNORMAL only
     # ------------------------------------------------------------------
     def generate_heatmaps(self, device, args):
-        """Save anomaly heatmaps for ABNORMAL test images only."""
         self.model.eval()
         save_path = os.path.join(args.save_dir, args.save_name, 'heatmap')
         os.makedirs(save_path, exist_ok=True)
-
-        eval_loader = self.loader_dict['eval']
         n_saved = 0
 
         with torch.no_grad():
-            for _, x, xo, y, file_names in tqdm(eval_loader, desc='Generating heatmaps'):
+            for _, x, xo, y, file_names in tqdm(
+                    self.loader_dict['eval'], desc='Generating heatmaps'):
                 x = x.to(device)
                 result = self.model(x)
-
                 anomaly_maps = F.interpolate(
-                    result['p_all'],
-                    size=xo.shape[1:3],
-                    mode='bilinear',
-                    align_corners=False,
+                    result['p_all'], size=xo.shape[1:3],
+                    mode='bilinear', align_corners=False,
                 )
-
                 for i in range(xo.shape[0]):
-                    # FIX: only save heatmaps for ABNORMAL images (label == 1)
                     label = int(y[i].item()) if torch.is_tensor(y[i]) else int(y[i])
                     if label != 1:
                         continue
-
-                    image    = xo[i].cpu().numpy().astype(np.uint8)
-                    amap     = anomaly_maps[i].cpu().squeeze().numpy()
-                    fname    = os.path.basename(file_names[i])
+                    image = xo[i].cpu().numpy().astype(np.uint8)
+                    amap  = anomaly_maps[i].cpu().squeeze().numpy()
+                    fname = os.path.basename(file_names[i])
                     self.save_anomaly_map(amap, image, save_path, fname)
                     n_saved += 1
 
-        self.print_fn(f"Heatmaps saved for {n_saved} ABNORMAL images → {save_path}")
+        self.print_fn(f"Heatmaps saved for {n_saved} ABNORMAL images -> {save_path}")
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
     def save_model(self, save_name, save_path):
         os.makedirs(save_path, exist_ok=True)
-        save_filename = os.path.join(save_path, save_name)
-        torch.save(
-            {
-                'model':     self.model.state_dict(),
-                'optimizer': self.optimizer.state_dict() if self.optimizer else None,
-                'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-                'it':        self.it,
-            },
-            save_filename,
-        )
-        self.print_fn(f"Checkpoint saved: {save_filename}")
+        torch.save({
+            'model':     self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict() if self.optimizer else None,
+            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+            'it':        self.it,
+        }, os.path.join(save_path, save_name))
+        self.print_fn(f"Checkpoint saved: {os.path.join(save_path, save_name)}")
 
     def load_model(self, load_path):
         checkpoint = torch.load(load_path, map_location='cpu')
@@ -396,31 +356,22 @@ class EDC:
         self.print_fn(f"Model loaded from {load_path} (iter={self.it})")
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Helpers
     # ------------------------------------------------------------------
     def _reduce_map(self, pmap):
-        """
-        Reduce a spatial anomaly map (B,1,H,W) to a per-image scalar.
-        Uses top-k% mean when self.amap_reduction is a float,
-        'mean' for global mean, 'max' for global max.
-        """
-        flat = pmap.flatten(1)                    # (B, H*W)
+        flat = pmap.flatten(1)
         if isinstance(self.amap_reduction, float):
             k = max(1, int(flat.shape[1] * self.amap_reduction))
             return torch.sort(flat, dim=1, descending=True)[0][:, :k].mean(dim=1)
         elif self.amap_reduction == 'mean':
             return flat.mean(1)
-        else:                                     # 'max'
+        else:
             return flat.max(1)[0]
 
-    # ------------------------------------------------------------------
-    # Visualisation helpers
-    # ------------------------------------------------------------------
     def save_anomaly_map(self, anomaly_map, image, save_path, file_name):
         anomaly_map_norm = min_max_norm(anomaly_map)
-        heatmap    = cvt2heatmap(anomaly_map_norm * 255)
-        hm_on_img  = heatmap_on_image(heatmap, image)
-
+        heatmap   = cvt2heatmap(anomaly_map_norm * 255)
+        hm_on_img = heatmap_on_image(heatmap, image)
         base = os.path.splitext(file_name)[0]
         cv2.imwrite(os.path.join(save_path, base + '_overlay.png'), hm_on_img)
         cv2.imwrite(
@@ -430,7 +381,7 @@ class EDC:
 
 
 # ---------------------------------------------------------------------------
-# Utility functions
+# Standalone utilities
 # ---------------------------------------------------------------------------
 def cvt2heatmap(gray):
     return cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
@@ -444,21 +395,19 @@ def heatmap_on_image(heatmap, image):
 
 def min_max_norm(image):
     a_min, a_max = image.min(), image.max()
-    if a_max == a_min:          # guard against flat maps
+    if a_max == a_min:
         return np.zeros_like(image)
     return (image - a_min) / (a_max - a_min)
 
 
 def return_best_thr(y_true, y_score):
+    from sklearn.metrics import precision_recall_curve
     precs, recs, thrs = precision_recall_curve(y_true, y_score)
-    f1s = 2 * precs * recs / (precs + recs + 1e-7)
-    f1s = f1s[:-1]
+    f1s  = 2 * precs * recs / (precs + recs + 1e-7)
+    f1s  = f1s[:-1]
     mask = ~np.isnan(f1s)
-    thrs = thrs[mask]
-    f1s  = f1s[mask]
-    if len(f1s) == 0:
-        return 0.5
-    return thrs[np.argmax(f1s)]
+    thrs, f1s = thrs[mask], f1s[mask]
+    return float(thrs[np.argmax(f1s)]) if len(f1s) > 0 else 0.5
 
 
 def specificity_score(y_true, y_pred):
