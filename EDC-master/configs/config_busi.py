@@ -10,24 +10,25 @@ except ImportError:
 
 ENV = "colab" if IN_COLAB else "local"
 
-# ---------------- DEVICE ----------------
 if torch.cuda.is_available():
     device = torch.device("cuda")
 else:
     device = torch.device("cpu")
 
-# ---------------- PATHS ----------------
 BASE_DIR = "/home/cs24d0008/EDC_Segmentation"
+#BASE_DIR = "/Users/anushk/Desktop/EDC_Segmentation"
 
 CODE_DIR = os.path.join(BASE_DIR, "EDC-master")
 
-# 🔥 CHANGE: BUSI dataset path
 DATASET_DIR = os.path.join(CODE_DIR, "datasets", "BUSI")
 
 TRAIN_DIR = os.path.join(DATASET_DIR, "train")
 TEST_DIR  = os.path.join(DATASET_DIR, "test")
+MASK_DIR  = os.path.join(DATASET_DIR, "masks")
 
 SAVED_MODELS_DIR = os.path.join(CODE_DIR, "saved_models")
+
+SEG_DIR = os.path.join(BASE_DIR, "BUSI_SEG")
 
 
 # --------------------------------------------------
@@ -42,5 +43,7 @@ def print_config():
     print(f"Dataset root:    {DATASET_DIR}")
     print(f"Train folder:    {TRAIN_DIR}")
     print(f"Test folder:     {TEST_DIR}")
+    print(f"Mask folder:     {MASK_DIR}")
     print(f"Saved models:    {SAVED_MODELS_DIR}")
+    print(f"Seg dataset:     {SEG_DIR}")
     print("================================")

@@ -1,7 +1,13 @@
 # runners_edc/edc_lgg.py
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# --------------------------------------------------
+# Add project root and datasets/ to PYTHONPATH
+# --------------------------------------------------
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, "datasets"))
 
 import argparse
 import random
@@ -17,8 +23,11 @@ from collections import Counter
 from helper_modules.utils import get_logger, count_parameters, over_write_args_from_file
 from helper_modules.train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
 from methods.edc1 import EDC
-from datasets.dataset import AD_Dataset
+
+# ✅ FIX: import from dataset_lgg not dataset
+from datasets.dataset_lgg import AD_Dataset
 from datasets.data_utils import get_data_loader
+
 from models.edc import R50_R50
 from configs.config_lgg import DATASET_DIR
 
@@ -45,6 +54,9 @@ def main_worker(gpu, args):
     np.random.seed(args.seed)
     cudnn.deterministic = True
 
+    # Free GPU memory
+    torch.cuda.empty_cache()
+
     save_path = os.path.join(args.save_dir, args.save_name)
     os.makedirs(save_path, exist_ok=True)
     logger = get_logger(args.save_name, save_path, "INFO")
@@ -70,6 +82,20 @@ def main_worker(gpu, args):
     logger.info(f"Train -> Normal: {train_counts.get(0,0)}  Abnormal: {train_counts.get(1,0)}")
     logger.info(f"Eval  -> Normal: {eval_counts.get(0,0)}   Abnormal: {eval_counts.get(1,0)}")
 
+    # ✅ Auto-scale iterations based on dataset size
+    n_train = len(train_dset)
+    iters_per_epoch   = max(1, n_train // args.batch_size)
+    recommended_iters = max(args.num_train_iter, iters_per_epoch * 10)
+
+    if recommended_iters > args.num_train_iter:
+        logger.info(
+            f"[INFO] Scaling num_train_iter: "
+            f"{args.num_train_iter} → {recommended_iters} "
+            f"(10 epochs × {n_train} samples ÷ batch {args.batch_size})"
+        )
+        args.num_train_iter = recommended_iters
+        args.num_eval_iter  = max(args.num_eval_iter, iters_per_epoch * 2)
+
     generator_lb = torch.Generator().manual_seed(args.seed)
 
     loader_dict = {
@@ -88,7 +114,7 @@ def main_worker(gpu, args):
         ),
     }
 
-    # Model with RQASW novelty baked in
+    # Model with RQASW novelty
     model = R50_R50(
         img_size=args.img_size,
         train_encoder=True,
@@ -96,7 +122,7 @@ def main_worker(gpu, args):
         reshape=True,
         bn_pretrain=True,
         var_reg_weight=args.var_reg_weight,
-        ema_momentum=args.ema_momentum,   # RQASW: EMA decay
+        ema_momentum=args.ema_momentum,
     )
 
     if torch.cuda.is_available():
@@ -112,7 +138,7 @@ def main_worker(gpu, args):
     runner = EDC(
         model=model,
         num_eval_iter=args.num_eval_iter,
-        amap_reduction=0.1,
+        amap_reduction='mean',
         tb_log=None,
         logger=logger,
     )
@@ -136,7 +162,7 @@ def main_worker(gpu, args):
     runner.tb_log = TBLog(save_path, "tb", use_tensorboard=args.use_tensorboard)
     logger.info(f"Arguments: {args}")
 
-    # Train (generate_heatmaps called inside train())
+    # Train
     eval_dict = runner.train(args, device=device, logger=logger)
     best_thr  = eval_dict['eval/best_thr']
     logger.warning("Training COMPLETED.")
@@ -169,6 +195,23 @@ def main_worker(gpu, args):
     y_score = np.array(eval_dict["eval/y_score"])
     y_pred  = (y_score >= best_thr).astype(int)
 
+    # Score distribution logger
+    normal_scores   = y_score[y_true == 0]
+    abnormal_scores = y_score[y_true == 1]
+    logger.info(
+        f"\n===== Score Distribution =====\n"
+        f"  NORMAL   mean:{normal_scores.mean():.4f} "
+        f"std:{normal_scores.std():.4f} "
+        f"min:{normal_scores.min():.4f} "
+        f"max:{normal_scores.max():.4f}\n"
+        f"  ABNORMAL mean:{abnormal_scores.mean():.4f} "
+        f"std:{abnormal_scores.std():.4f} "
+        f"min:{abnormal_scores.min():.4f} "
+        f"max:{abnormal_scores.max():.4f}\n"
+        f"  Best threshold: {best_thr:.4f}\n"
+        f"=============================="
+    )
+
     cm = confusion_matrix(y_true, y_pred)
     print("\n======== CONFUSION MATRIX ========\n")
     print(pd.DataFrame(cm,
@@ -186,9 +229,9 @@ def main_worker(gpu, args):
     os.makedirs(norm_as_abn_dir, exist_ok=True)
     os.makedirs(abn_as_norm_dir, exist_ok=True)
 
-    eval_paths     = eval_dset.img_paths
-    results        = []
-    misclassified  = []
+    eval_paths    = eval_dset.img_paths
+    results       = []
+    misclassified = []
     mis_normal = mis_abnormal = 0
     total_normal   = int((y_true == 0).sum())
     total_abnormal = int((y_true == 1).sum())
@@ -231,7 +274,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--epoch',            type=int,      default=1)
     parser.add_argument('--num_train_iter',   type=int,      default=3000)
-    parser.add_argument('--num_eval_iter',    type=int,      default=1000)
+    parser.add_argument('--num_eval_iter',    type=int,      default=500)
+
     parser.add_argument('-bsz','--batch_size',type=int,      default=32)
     parser.add_argument('--eval_batch_size',  type=int,      default=64)
 
@@ -242,9 +286,8 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay',     type=float,    default=1e-4)
     parser.add_argument('--amp',              type=str2bool, default=False)
     parser.add_argument('--clip',             type=float,    default=1.0)
-    parser.add_argument('--var_reg_weight',   type=float,    default=0.04)
-    parser.add_argument('--ema_momentum',     type=float,    default=0.99,
-                        help='RQASW EMA decay (0.99 recommended)')
+    parser.add_argument('--var_reg_weight',   type=float,    default=0.1)
+    parser.add_argument('--ema_momentum',     type=float,    default=0.99)
 
     parser.add_argument('--data_dir',         type=str,      default=DATASET_DIR)
     parser.add_argument('-ds','--dataset',    type=str,      default='lgg_mri')

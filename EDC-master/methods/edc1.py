@@ -41,6 +41,35 @@ class TimerEvent:
 
 
 # ---------------------------------------------------------------------------
+# Helper: convert raw xo[i] tensor → (H, W, 3) uint8 numpy for saving
+# ---------------------------------------------------------------------------
+def to_hwc_uint8(img_np):
+    """
+    Accepts any of:
+      - (C, H, W)  float or uint8   → transpose to (H, W, C)
+      - (H, W, C)  float or uint8   → keep as-is
+      - (H, W)     grayscale        → expand to (H, W, 3)
+    Always returns (H, W, 3) uint8.
+    """
+    if img_np.ndim == 2:
+        # grayscale (H, W) → (H, W, 3)
+        img_np = np.stack([img_np, img_np, img_np], axis=-1)
+    elif img_np.ndim == 3:
+        if img_np.shape[0] in (1, 3) and img_np.shape[0] < img_np.shape[1]:
+            # CHW → HWC
+            img_np = np.transpose(img_np, (1, 2, 0))
+        if img_np.shape[-1] == 1:
+            # single-channel HWC → 3-channel
+            img_np = np.repeat(img_np, 3, axis=-1)
+    # scale float [0,1] to uint8 if needed
+    if img_np.dtype != np.uint8:
+        if img_np.max() <= 1.0:
+            img_np = (img_np * 255)
+        img_np = img_np.astype(np.uint8)
+    return img_np
+
+
+# ---------------------------------------------------------------------------
 # EDC trainer / evaluator
 # ---------------------------------------------------------------------------
 class EDC:
@@ -258,12 +287,16 @@ class EDC:
             if save_visual and args is not None:
                 vis_path = os.path.join(args.save_dir, args.save_name, 'heatmap')
                 os.makedirs(vis_path, exist_ok=True)
+
+                # Use last 2 spatial dims so it works for both CHW and HWC xo
+                h, w = xo.shape[-2], xo.shape[-1]
                 anomaly_maps = F.interpolate(
-                    result['p_all'], size=xo.shape[1:3],
+                    result['p_all'], size=(h, w),
                     mode='bilinear', align_corners=False,
                 )
                 for i in range(xo.shape[0]):
-                    image = xo[i].cpu().numpy().astype(np.uint8)
+                    # ✅ FIX: convert CHW/grayscale tensor → HWC uint8 numpy
+                    image = to_hwc_uint8(xo[i].cpu().numpy())
                     amap  = anomaly_maps[i].cpu().squeeze().numpy()
                     fname = os.path.basename(file_names[i])
                     self.save_anomaly_map(amap, image, vis_path, fname)
@@ -316,15 +349,20 @@ class EDC:
                     self.loader_dict['eval'], desc='Generating heatmaps'):
                 x = x.to(device)
                 result = self.model(x)
+
+                # Use last 2 spatial dims so it works for both CHW and HWC xo
+                h, w = xo.shape[-2], xo.shape[-1]
                 anomaly_maps = F.interpolate(
-                    result['p_all'], size=xo.shape[1:3],
+                    result['p_all'], size=(h, w),
                     mode='bilinear', align_corners=False,
                 )
                 for i in range(xo.shape[0]):
                     label = int(y[i].item()) if torch.is_tensor(y[i]) else int(y[i])
                     if label != 1:
                         continue
-                    image = xo[i].cpu().numpy().astype(np.uint8)
+
+                    # ✅ FIX: convert CHW/grayscale tensor → HWC uint8 numpy
+                    image = to_hwc_uint8(xo[i].cpu().numpy())
                     amap  = anomaly_maps[i].cpu().squeeze().numpy()
                     fname = os.path.basename(file_names[i])
                     self.save_anomaly_map(amap, image, save_path, fname)
@@ -369,9 +407,19 @@ class EDC:
             return flat.max(1)[0]
 
     def save_anomaly_map(self, anomaly_map, image, save_path, file_name):
+        """
+        anomaly_map : (H, W)      float numpy
+        image       : (H, W, 3)   uint8 numpy  — must already be HWC
+        """
+        # Resize anomaly map to match image if sizes differ
+        h, w = image.shape[:2]
+        if anomaly_map.shape != (h, w):
+            anomaly_map = cv2.resize(anomaly_map, (w, h))
+
         anomaly_map_norm = min_max_norm(anomaly_map)
-        heatmap   = cvt2heatmap(anomaly_map_norm * 255)
-        hm_on_img = heatmap_on_image(heatmap, image)
+        heatmap          = cvt2heatmap(anomaly_map_norm * 255)   # (H,W,3) uint8
+        hm_on_img        = heatmap_on_image(heatmap, image)      # (H,W,3) uint8
+
         base = os.path.splitext(file_name)[0]
         cv2.imwrite(os.path.join(save_path, base + '_overlay.png'), hm_on_img)
         cv2.imwrite(
@@ -388,6 +436,11 @@ def cvt2heatmap(gray):
 
 
 def heatmap_on_image(heatmap, image):
+    """
+    heatmap : (H, W, 3) uint8
+    image   : (H, W, 3) uint8
+    Both must be same shape — guaranteed by save_anomaly_map.
+    """
     out = np.float32(heatmap) / 255 + np.float32(image) / 255
     out = out / np.max(out)
     return np.uint8(255 * out)

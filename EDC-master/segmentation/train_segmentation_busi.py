@@ -1,194 +1,144 @@
+# segmentation/train_segmentation_busi.py
+# NOVELTY 2: HGBL — unchanged
+# Infrastructure: focal loss, deeper UNet, OneCycleLR, 200 epochs
+
 import os
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
-import random
-import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, random_split
+from tqdm import tqdm
 
-# 🔥 FIXED IMPORT (important)
-from segmentation.dataset_busi import BUSISegDataset
-from segmentation.unet import UNet
+from dataset_busi import BUSISegDataset
+from unet import UNet
+
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+DATASET_PATH = "../BUSI_SEG"
+BATCH_SIZE   = 8
+EPOCHS       = 200
+LR           = 3e-4
+SEED         = 42
+SAVE_DIR     = "./seg_checkpoints_busi"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+LAMBDA_B = 2.0
+LAMBDA_H = 1.0
 
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# 🔥 USE ABSOLUTE PATH (avoid errors)
-BASE_DIR = "/home/cs24d0008/EDC_Segmentation/EDC-master"
-DATASET_PATH = os.path.join(BASE_DIR, "datasets/BUSI_SEG")
-
-BATCH_SIZE = 8
-EPOCHS = 100
-LR = 1e-4
-
-
-# ---------------- Dice ----------------
 def dice_score(pred, target):
     pred = (pred > 0.5).float()
-    intersection = (pred * target).sum()
-    return (2. * intersection + 1e-8) / (pred.sum() + target.sum() + 1e-8)
+    return (2.*(pred*target).sum()+1e-8) / (pred.sum()+target.sum()+1e-8)
 
-
-# ---------------- IoU ----------------
 def iou_score(pred, target):
     pred = (pred > 0.5).float()
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum() - intersection
-    return (intersection + 1e-8) / (union + 1e-8)
+    inter = (pred*target).sum()
+    return (inter+1e-8) / (pred.sum()+target.sum()-inter+1e-8)
 
-
-# ---------------- Dice Loss ----------------
 def dice_loss(pred, target):
-    smooth = 1e-8
-    intersection = (pred * target).sum()
-    dice = (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
-    return 1 - dice
+    inter = (pred*target).sum()
+    return 1. - (2.*inter+1e-8) / (pred.sum()+target.sum()+1e-8)
+
+def focal_loss(pred, target, alpha=0.8, gamma=2.0):
+    bce = F.binary_cross_entropy(pred, target, reduction='none')
+    pt  = torch.where(target==1, pred, 1-pred)
+    return (alpha*(1-pt)**gamma*bce).mean()
+
+def baseline_loss(pred, target):
+    return F.binary_cross_entropy(pred,target) + dice_loss(pred,target) + focal_loss(pred,target)
+
+def boundary_map(mask, kernel_size=5):
+    pad     = kernel_size//2
+    dilated = F.max_pool2d(mask, kernel_size, stride=1, padding=pad)
+    eroded  = -F.max_pool2d(-mask, kernel_size, stride=1, padding=pad)
+    return (dilated-eroded).clamp(0.,1.)
+
+def hgbl_loss(pred, mask, heatmap, lambda_b=LAMBDA_B, lambda_h=LAMBDA_H):
+    B     = boundary_map(mask)
+    H_max = heatmap.flatten(1).max(1)[0].view(-1,1,1,1).clamp(min=1e-8)
+    H     = heatmap / H_max
+    W     = (1.+lambda_b*B)*(1.+lambda_h*H)
+    wbce  = (F.binary_cross_entropy(pred,mask,reduction='none')*W).mean()
+    return wbce + dice_loss(pred,mask) + focal_loss(pred,mask)
 
 
-# ---------------- Train ----------------
-def train_epoch(model, loader, optimizer, criterion):
-
-    model.train()
-    total_loss = 0
-
-    for x, y in tqdm(loader):
-        x = x.to(DEVICE)
-        y = y.to(DEVICE)
-
+def train_epoch(model, loader, optimizer, use_hgbl=True):
+    model.train(); total=0.
+    for image,heatmap,mask in tqdm(loader,leave=False,desc='  train'):
+        image,heatmap,mask = image.to(DEVICE),heatmap.to(DEVICE),mask.to(DEVICE)
         optimizer.zero_grad()
-        pred = model(x)
+        pred = model(torch.cat([image,heatmap],dim=1))
+        loss = hgbl_loss(pred,mask,heatmap) if use_hgbl else baseline_loss(pred,mask)
+        loss.backward(); optimizer.step(); total+=loss.item()
+    return total/len(loader)
 
-        loss = criterion(pred, y)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    return total_loss / len(loader)
-
-
-# ---------------- Evaluate ----------------
 def evaluate(model, loader):
-
-    model.eval()
-    dice_total = 0
-    iou_total = 0
-
+    model.eval(); dt=it=0.
     with torch.no_grad():
-        for x, y in loader:
-            x = x.to(DEVICE)
-            y = y.to(DEVICE)
-
-            pred = model(x)
-
-            dice_total += dice_score(pred, y).item()
-            iou_total += iou_score(pred, y).item()
-
-    return dice_total / len(loader), iou_total / len(loader)
+        for image,heatmap,mask in loader:
+            image,heatmap,mask=image.to(DEVICE),heatmap.to(DEVICE),mask.to(DEVICE)
+            pred=model(torch.cat([image,heatmap],dim=1))
+            dt+=dice_score(pred,mask).item(); it+=iou_score(pred,mask).item()
+    return dt/len(loader), it/len(loader)
 
 
-# ---------------- Experiment ----------------
-def run_experiment(use_heatmap, use_pseudo, save_dir):
+def run_experiment(use_hgbl, tag=''):
+    label = 'HGBL' if use_hgbl else 'Baseline'
+    print(f"\n{'='*62}\n  {label}  {tag}\n{'='*62}\n")
+    torch.manual_seed(SEED); np.random.seed(SEED)
 
-    dataset = BUSISegDataset(
-        DATASET_PATH,
-        use_heatmap=use_heatmap,
-        use_pseudo=use_pseudo
-    )
+    full = BUSISegDataset(DATASET_PATH)
+    n    = len(full); nt=int(0.8*n); nv=n-nt
+    gen  = torch.Generator().manual_seed(SEED)
+    ti,vi = random_split(range(n),[nt,nv],generator=gen)
 
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
+    tl = DataLoader(Subset(full,ti.indices), BATCH_SIZE, shuffle=True,
+                    num_workers=4, pin_memory=True, drop_last=False)
+    vl = DataLoader(Subset(full,vi.indices), BATCH_SIZE, shuffle=False,
+                    num_workers=4, pin_memory=True, drop_last=False)
 
-    train_set, test_set = random_split(dataset, [train_size, test_size])
+    model = UNet(in_channels=4, dropout_p=0.3).to(DEVICE)
+    opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=LR, steps_per_epoch=len(tl), epochs=EPOCHS, pct_start=0.1)
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, num_workers=4)
+    best=0.; ckpt=os.path.join(SAVE_DIR,f"best_unet_busi_{'hgbl' if use_hgbl else 'baseline'}.pth")
 
-    in_channels = 4 if use_heatmap else 3
+    for ep in range(1,EPOCHS+1):
+        loss=train_epoch(model,tl,opt,use_hgbl); dice,iou=evaluate(model,vl); sched.step()
+        imp=''
+        if dice>best: best=dice; torch.save(model.state_dict(),ckpt); imp='  <- best'
+        if ep%20==0 or imp:
+            print(f"  Ep {ep:3d}/{EPOCHS} | Loss {loss:.4f} | Dice {dice:.4f} | IoU {iou:.4f}{imp}")
 
-    model = UNet(in_channels).to(DEVICE)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-
-    bce = nn.BCELoss()
-
-    def criterion(pred, target):
-        return bce(pred, target) + dice_loss(pred, target)
-
-    best_dice = 0
-    best_iou = 0
-
-    for epoch in range(EPOCHS):
-
-        loss = train_epoch(model, train_loader, optimizer, criterion)
-        dice, iou = evaluate(model, test_loader)
-
-        if dice > best_dice:
-            best_dice = dice
-            best_iou = iou
-
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss {loss:.4f} | Dice {dice:.4f} | IoU {iou:.4f}")
-
-    save_grid_predictions(model, test_loader, save_dir, use_heatmap)
-
-    return best_dice, best_iou
+    model.load_state_dict(torch.load(ckpt,map_location=DEVICE))
+    fd,fi=evaluate(model,vl)
+    print(f"\n  Best -> Dice {fd:.4f} | IoU {fi:.4f}")
+    return fd,fi
 
 
-# ---------------- Visualization ----------------
-def save_grid_predictions(model, loader, save_dir, use_heatmap):
-
-    model.eval()
-    os.makedirs(save_dir, exist_ok=True)
-
-    with torch.no_grad():
-        for idx, (x, y) in enumerate(loader):
-
-            x = x.to(DEVICE)
-            pred = model(x)
-            pred = (pred > 0.5).float()
-
-            for i in range(x.shape[0]):
-
-                img = x[i].cpu().numpy()
-                gt = y[i].numpy()[0]
-                pr = pred[i].cpu().numpy()[0]
-
-                img_rgb = (np.transpose(img[:3], (1,2,0)) * 255).astype(np.uint8)
-                gt_img = (gt * 255).astype(np.uint8)
-                pr_img = (pr * 255).astype(np.uint8)
-
-                gt_img = cv2.cvtColor(gt_img, cv2.COLOR_GRAY2BGR)
-                pr_img = cv2.cvtColor(pr_img, cv2.COLOR_GRAY2BGR)
-
-                panels = [img_rgb]
-
-                if use_heatmap:
-                    heatmap = (img[3] * 255).astype(np.uint8)
-                    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_GRAY2BGR)
-                    panels.append(heatmap)
-
-                panels.extend([pr_img, gt_img])
-
-                grid = np.concatenate(panels, axis=1)
-
-                save_path = os.path.join(save_dir, f"sample_{idx}_{i}.png")
-                cv2.imwrite(save_path, grid)
-
-            break
+def run_ablation():
+    global LAMBDA_B,LAMBDA_H; r={}
+    d,i=run_experiment(False,'[row1]'); r['Baseline']=(d,i)
+    LAMBDA_H=0.;LAMBDA_B=2.; d,i=run_experiment(True,'[row2]'); r['+ Boundary']=(d,i)
+    LAMBDA_H=1.;LAMBDA_B=0.; d,i=run_experiment(True,'[row3]'); r['+ Heatmap']=(d,i)
+    LAMBDA_H=1.;LAMBDA_B=2.; d,i=run_experiment(True,'[row4]'); r['Full HGBL']=(d,i)
+    print("\n"+"="*62+"\n  ABLATION — BUSI\n"+"="*62)
+    for m,(d,i) in r.items(): print(f"  {m:<38} {d:.4f}  {i:.4f}")
+    return r
 
 
-# ---------------- MAIN ----------------
 if __name__ == "__main__":
-
-    print("\n--- Baseline ---\n")
-    dice1, iou1 = run_experiment(False, False, "outputs/busi_baseline")
-
-    print("\n--- Heatmap Guided ---\n")
-    dice2, iou2 = run_experiment(True, False, "outputs/busi_heatmap")
-
-    print("\n===== FINAL RESULTS =====")
-    print(f"Baseline Dice: {dice1:.4f}")
-    print(f"Baseline IoU : {iou1:.4f}")
-    print(f"Heatmap Dice: {dice2:.4f}")
-    print(f"Heatmap IoU : {iou2:.4f}")
+    import argparse
+    p=argparse.ArgumentParser()
+    p.add_argument('--ablation',action='store_true')
+    p.add_argument('--lambda_b',type=float,default=2.0)
+    p.add_argument('--lambda_h',type=float,default=1.0)
+    a=p.parse_args(); LAMBDA_B=a.lambda_b; LAMBDA_H=a.lambda_h
+    if a.ablation: run_ablation()
+    else:
+        db,ib=run_experiment(False,'[baseline]')
+        dh,ih=run_experiment(True,'[HGBL]')
+        print(f"\n{'='*62}\n  FINAL RESULTS — BUSI\n{'='*62}")
+        print(f"  Baseline -> Dice:{db:.4f} IoU:{ib:.4f}")
+        print(f"  HGBL     -> Dice:{dh:.4f} IoU:{ih:.4f}")
+        print(f"  Delta    -> Dice:{dh-db:+.4f} IoU:{ih-ib:+.4f}\n{'='*62}")

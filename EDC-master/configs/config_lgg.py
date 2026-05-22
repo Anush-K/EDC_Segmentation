@@ -20,7 +20,8 @@ BASE_DIR = "/home/cs24d0008/EDC_Segmentation"
 
 CODE_DIR = os.path.join(BASE_DIR, "EDC-master")
 
-DATASET_DIR = os.path.join(BASE_DIR, "LGG")
+# ✅ CHANGED: LGG_balanced → LGG_new (prepared by prepare_lgg.py)
+DATASET_DIR = os.path.join(BASE_DIR, "LGG_new")
 
 TRAIN_DIR = os.path.join(DATASET_DIR, "train")
 TEST_DIR  = os.path.join(DATASET_DIR, "test")
