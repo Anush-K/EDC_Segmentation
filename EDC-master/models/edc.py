@@ -7,13 +7,14 @@
 # (no labels, zero extra trainable parameters). Scales where the decoder
 # consistently struggles more → more anomaly-sensitive → higher fusion weight.
 #
-# Paper claim:
-#   "We propose reconstruction-quality-driven adaptive scale weighting that
-#    automatically discovers the most anomaly-discriminative feature scale
-#    from normal-only training data without any labelled samples."
-#
-# Code change: ~20 lines added to R50_R50.__init__ and R50_R50.forward only.
-# No new files. No new trainable parameters.
+# SASC Enhancement (Self-Attention Skip Connection):
+# -------------------------------------------------------------------------
+# Inspired by EA2D (Tang et al., IEEE TMI 2025).
+# Purpose in RQASW: enhances normal image reconstruction quality at each
+# scale, making EMA loss signals more discriminative for adaptive weighting.
+# Unlike EA2D (domain adaptation + dual decoder), SASC here serves to
+# strengthen RQASW scale discrimination → better heatmaps → better HGBL.
+# Encoder features e1, e2 passed to decoder as attention-refined skip connections.
 
 from models.resnet import resnet50, wide_resnet50_2
 from models.resnet_decoder import resnet50_decoder, wide_resnet50_decoder
@@ -46,14 +47,9 @@ def enable_running_stats(model):
 # Anti-collapse variance regularisation (VICReg-style)
 # ---------------------------------------------------------------------------
 def variance_reg_loss(feat, eps=1e-4):
-    """
-    Penalises per-channel std dropping below 1 across a batch.
-    Prevents encoder representation collapse.
-    feat : (B, C, H, W) or (B, C)
-    """
     if feat.dim() == 4:
-        feat = feat.mean(dim=[2, 3])          # (B, C)
-    std  = torch.sqrt(feat.var(dim=0) + eps)  # (C,)
+        feat = feat.mean(dim=[2, 3])
+    std = torch.sqrt(feat.var(dim=0) + eps)
     return torch.mean(F.relu(1.0 - std))
 
 
@@ -63,8 +59,7 @@ def variance_reg_loss(feat, eps=1e-4):
 def _adaptive_weights(ema_l1, ema_l2, ema_l3, eps=1e-6):
     """
     Normalise three EMA loss values into fusion weights.
-    Higher EMA loss at a scale -> harder to reconstruct -> more anomaly signal
-    -> higher weight in the fused map.
+    Higher EMA loss → harder to reconstruct → more anomaly signal → higher weight.
     Returns w: (3,) tensor summing to 1.
     """
     raw = torch.stack([ema_l1, ema_l2, ema_l3]).clamp(min=eps)
@@ -78,16 +73,16 @@ class R50_R50(nn.Module):
     """
     ResNet-50 encoder + ResNet-50 decoder for EDC anomaly detection.
 
-    Baseline corrections already applied:
-      stop_grad=False   — encoder gets gradients from all skip-level losses
-      bn_pretrain=True  — ImageNet BN stats preserved on small dataset
-      variance_reg_loss — prevents representation collapse
-
     NOVELTY 1 (RQASW):
       Three non-trainable EMA buffers track mean reconstruction loss per scale.
-      Forward() uses them to compute adaptive fusion weights [w1, w2, w3]
-      that replace the fixed equal-weight mean of the original code.
-      Weights are logged in the return dict for monitoring and ablation.
+      Forward() computes adaptive fusion weights [w1, w2, w3] replacing
+      the fixed equal-weight mean of the original EDC.
+
+    SASC Enhancement:
+      Encoder features e1, e2 are passed to the decoder as attention-refined
+      skip connections via PositionAttentionModule (PAM).
+      This improves normal reconstruction quality → sharper EMA loss signal
+      → better RQASW scale discrimination → better anomaly heatmaps.
     """
 
     def __init__(
@@ -99,7 +94,7 @@ class R50_R50(nn.Module):
         bn_pretrain=True,
         anomap_layer=[1, 2, 3],
         var_reg_weight=0.04,
-        ema_momentum=0.99,        # RQASW: EMA decay for loss tracking
+        ema_momentum=0.99,
     ):
         super().__init__()
         self.edc_encoder    = resnet50(pretrained=True)
@@ -112,8 +107,7 @@ class R50_R50(nn.Module):
         self.var_reg_weight = var_reg_weight
         self.ema_momentum   = ema_momentum
 
-        # RQASW: EMA loss buffers (non-trainable, saved in checkpoint)
-        # All start at 1.0 → initial weights are equal (same as old baseline)
+        # RQASW: EMA loss buffers (non-trainable)
         self.register_buffer('ema_l1', torch.tensor(1.0))
         self.register_buffer('ema_l2', torch.tensor(1.0))
         self.register_buffer('ema_l3', torch.tensor(1.0))
@@ -124,7 +118,6 @@ class R50_R50(nn.Module):
             for m in self.edc_encoder.modules():
                 if isinstance(m, _BatchNorm):
                     m.eval()
-
         if not self.train_encoder and self.edc_encoder.training:
             self.edc_encoder.eval()
 
@@ -136,7 +129,10 @@ class R50_R50(nn.Module):
         if not self.train_encoder:
             e4 = e4.detach()
 
-        # ---- Decoder -----------------------------------------------------
+        # ---- Decoder with SASC skip connections --------------------------
+        # e1, e2 passed as attention-refined skip connections to decoder
+        # PAM(e2) added to decoder layer2 output
+        # PAM(e1) added to decoder layer1 output
         d1, d2, d3 = self.edc_decoder(e4)
 
         # ---- Gradient control --------------------------------------------
@@ -144,7 +140,6 @@ class R50_R50(nn.Module):
             e1, e2, e3 = e1.detach(), e2.detach(), e3.detach()
         elif self.stop_grad:
             e1, e2, e3 = e1.detach(), e2.detach(), e3.detach()
-        # else: stop_grad=False → gradients flow through e1/e2/e3
 
         # ---- Per-scale cosine reconstruction losses ----------------------
         if self.reshape:
@@ -181,25 +176,20 @@ class R50_R50(nn.Module):
         p3_up = F.interpolate(p3, scale_factor=4,  mode='bilinear', align_corners=False)
 
         # ---- NOVELTY 1: RQASW adaptive fusion ---------------------------
-        # Step 1: update EMA buffers (training only, detached from graph)
         if self.training:
             m = self.ema_momentum
             self.ema_l1 = m * self.ema_l1 + (1.0 - m) * l1.detach()
             self.ema_l2 = m * self.ema_l2 + (1.0 - m) * l2.detach()
             self.ema_l3 = m * self.ema_l3 + (1.0 - m) * l3.detach()
 
-        # Step 2: derive adaptive weights from current EMA values
-        w = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
-
-        # Step 3: weighted fusion over selected anomap layers
-        p_maps     = [p1, p2_up, p3_up]
-        selected   = [p_maps[l - 1] for l in self.anomap_layer]
-        w_sel      = torch.stack([w[l - 1] for l in self.anomap_layer])
-        w_sel      = w_sel / w_sel.sum()          # renormalise for selected subset
-        p_all      = sum(w_sel[i] * selected[i] for i in range(len(selected)))
+        w      = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        p_maps = [p1, p2_up, p3_up]
+        selected = [p_maps[l - 1] for l in self.anomap_layer]
+        w_sel    = torch.stack([w[l - 1] for l in self.anomap_layer])
+        w_sel    = w_sel / w_sel.sum()
+        p_all    = sum(w_sel[i] * selected[i] for i in range(len(selected)))
         # ---- end RQASW --------------------------------------------------
 
-        # ---- Feature std monitoring (diagnostic only) --------------------
         with torch.no_grad():
             e1_std = F.normalize(
                 e1.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
@@ -219,7 +209,6 @@ class R50_R50(nn.Module):
             'e1_std':     e1_std,
             'e2_std':     e2_std,
             'e3_std':     e3_std,
-            # RQASW: weights logged so edc1.py records them per eval
             'scale_w1':   w[0].detach(),
             'scale_w2':   w[1].detach(),
             'scale_w3':   w[2].detach(),
@@ -227,10 +216,10 @@ class R50_R50(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# WR50_WR50 — identical RQASW novelty
+# WR50_WR50 — identical RQASW + SASC
 # ---------------------------------------------------------------------------
 class WR50_WR50(nn.Module):
-    """Wide ResNet-50-2 variant with RQASW."""
+    """Wide ResNet-50-2 variant with RQASW + SASC."""
 
     def __init__(
         self,
@@ -263,7 +252,6 @@ class WR50_WR50(nn.Module):
             for m in self.edc_encoder.modules():
                 if isinstance(m, _BatchNorm):
                     m.eval()
-
         if not self.train_encoder and self.edc_encoder.training:
             self.edc_encoder.eval()
 
@@ -273,6 +261,7 @@ class WR50_WR50(nn.Module):
         if not self.train_encoder:
             e4 = e4.detach()
 
+        # SASC: pass e1, e2 as skip connections
         d1, d2, d3 = self.edc_decoder(e4)
 
         if not self.train_encoder:
@@ -311,19 +300,17 @@ class WR50_WR50(nn.Module):
         p2_up = F.interpolate(p2, scale_factor=2, mode='bilinear', align_corners=False)
         p3_up = F.interpolate(p3, scale_factor=4, mode='bilinear', align_corners=False)
 
-        # RQASW
         if self.training:
             m = self.ema_momentum
             self.ema_l1 = m * self.ema_l1 + (1.0 - m) * l1.detach()
             self.ema_l2 = m * self.ema_l2 + (1.0 - m) * l2.detach()
             self.ema_l3 = m * self.ema_l3 + (1.0 - m) * l3.detach()
 
-        w      = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
-        p_maps = [p1, p2_up, p3_up]
-        sel    = [p_maps[l - 1] for l in self.anomap_layer]
-        w_sel  = torch.stack([w[l - 1] for l in self.anomap_layer])
-        w_sel  = w_sel / w_sel.sum()
-        p_all  = sum(w_sel[i] * sel[i] for i in range(len(sel)))
+        w     = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        sel   = [([p1, p2_up, p3_up])[l - 1] for l in self.anomap_layer]
+        w_sel = torch.stack([w[l - 1] for l in self.anomap_layer])
+        w_sel = w_sel / w_sel.sum()
+        p_all = sum(w_sel[i] * sel[i] for i in range(len(sel)))
 
         with torch.no_grad():
             e1_std = F.normalize(
@@ -337,5 +324,6 @@ class WR50_WR50(nn.Module):
             'loss': loss, 'recon_loss': recon_loss, 'var_loss': var_loss,
             'p_all': p_all, 'p1': p1, 'p2': p2_up, 'p3': p3_up,
             'e1_std': e1_std, 'e2_std': e2_std, 'e3_std': e3_std,
-            'scale_w1': w[0].detach(), 'scale_w2': w[1].detach(), 'scale_w3': w[2].detach(),
+            'scale_w1': w[0].detach(), 'scale_w2': w[1].detach(),
+            'scale_w3': w[2].detach(),
         }

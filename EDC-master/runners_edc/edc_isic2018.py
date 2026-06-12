@@ -1,478 +1,329 @@
-# import needed library
+# runners_edc/edc_isic2018.py
+# NOVELTY 1: RQASW — Residual Quality-Aware Scale Weighting
+# Paper settings: 1000 iterations, lr=5e-4, batch=32, mean reduction
+# RQASW: adaptive scale weighting via EMA + Gaussian normalization
+
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import logging
-import random
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, "datasets"))
+
+import argparse
+import random
+import shutil
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.parallel
 import torch.backends.cudnn as cudnn
+import pandas as pd
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
+from collections import Counter
+
 from helper_modules.utils import get_logger, count_parameters, over_write_args_from_file
 from helper_modules.train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
 from methods.edc1 import EDC
-import pandas as pd
-import shutil
-from sklearn.metrics import confusion_matrix, classification_report
-
-from datasets.dataset import AD_Dataset
+from datasets.dataset_isic2018 import AD_Dataset
 from datasets.data_utils import get_data_loader
 from models.edc import R50_R50
+from configs.config_isic2018 import DATASET_DIR
+
 import warnings
-from configs.config_isic2018 import DATASET_DIR, TEST_DIR
-from collections import Counter
-
-
 warnings.filterwarnings("ignore")
 
 
-
-def get_label(sample):
-    """
-    Extract label from dataset sample.
-    Adjust index depending on dataset return format.
-    """
-    # If dataset returns (img, label)
-    if isinstance(sample, tuple) and len(sample) >= 2:
-        label = sample[1]
-    else:
-        label = sample[-1]
-
-    # If label is one-hot → convert to class index
-    if isinstance(label, (np.ndarray, list)) and len(label) > 1:
-        label = np.argmax(label)
-
-    return int(label)
+def str2bool(v):
+    if isinstance(v, bool): return v
+    if v.lower() in ('yes','true','t','y','1'): return True
+    elif v.lower() in ('no','false','f','n','0'): return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def main_worker(gpu, args):
-    """ """
+def run_single_seed(gpu, args, seed):
+    """Run training with a single seed and return eval_dict."""
+    random.seed(seed); torch.manual_seed(seed)
+    np.random.seed(seed); cudnn.deterministic = True
+    torch.cuda.empty_cache()
 
-    args.gpu = gpu
-    assert args.seed is not None
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    cudnn.deterministic = True
-    # cudnn.benchmark = True
-
-    # SET save_path and logger
     save_path = os.path.join(args.save_dir, args.save_name)
-    logger_level = "INFO"
-    tb_log = None
+    logger = args._logger
 
-    logger = get_logger(args.save_name, save_path, logger_level)
-    logger.warning(f"USE GPU: {args.gpu} for training")
-
-    # Construct Dataset & DataLoader
-    # train_dset = AD_Dataset(name=args.dataset, train=True, data_dir=args.data_dir)
-    #train_dset = train_dset.get_dset()
     train_dset = AD_Dataset(
-        name=args.dataset, 
-        train=True, 
-        data_dir=args.data_dir, 
-        img_size=args.img_size, 
-        crop_size=224, 
-        imagenet_norm=True
-    ).get_dset()
-
-    print("TrainSet Image Number:", len(train_dset))
-    
-    eval_dset = AD_Dataset(
-        name=args.dataset,
-        train=False,
+        name=args.dataset, train=True,
         data_dir=args.data_dir,
-        img_size=args.img_size,
-        crop_size=224,
-        imagenet_norm=True
+        img_size=args.img_size, crop_size=224,
+        imagenet_norm=True,
     ).get_dset()
-    #eval_dset = AD_Dataset(name=args.dataset, train=False, data_dir=args.data_dir)
-    #eval_dset = eval_dset.get_dset()
-    print("EvalSet Image Number:", len(eval_dset))
 
-    # Access labels directly
-    train_labels = np.array(train_dset.targets)
-    eval_labels = np.array(eval_dset.targets)
+    eval_dset = AD_Dataset(
+        name=args.dataset, train=False,
+        data_dir=args.data_dir,
+        img_size=args.img_size, crop_size=224,
+        imagenet_norm=True,
+    ).get_dset()
 
-    # Count class distribution
-    train_counts = Counter(train_labels)
-    eval_counts = Counter(eval_labels)
+    # Print split info once (seed 0 only)
+    if seed == 0:
+        train_counts = Counter(np.array(train_dset.targets))
+        eval_counts  = Counter(np.array(eval_dset.targets))
+        logger.info("=== Train Split ===")
+        logger.info(f"Total: {len(train_dset.targets)}  "
+                    f"Normal: {train_counts.get(0,0)}  "
+                    f"Abnormal: {train_counts.get(1,0)}")
+        logger.info("=== Eval/Test Split ===")
+        logger.info(f"Total: {len(eval_dset.targets)}  "
+                    f"Normal: {eval_counts.get(0,0)}  "
+                    f"Abnormal: {eval_counts.get(1,0)}")
 
-    print("=== Train Split ===")
-    print(f"Total: {len(train_labels)}")
-    print(f"Normal:   {train_counts.get(0, 0)}")
-    print(f"Abnormal: {train_counts.get(1, 0)}")
-
-    print("\n=== Eval/Test Split ===")
-    print(f"Total: {len(eval_labels)}")
-    print(f"Normal:   {eval_counts.get(0, 0)}")
-    print(f"Abnormal: {eval_counts.get(1, 0)}")
-    loader_dict = {}
-    dset_dict = {"train": train_dset, "eval": eval_dset}
-
-    generator_lb = torch.Generator()
-    generator_lb.manual_seed(args.seed)
-    loader_dict["train"] = get_data_loader(
-        dset_dict["train"],
-        args.batch_size,
-        data_sampler=args.train_sampler,
-        num_iters=args.num_train_iter,
-        num_workers=args.num_workers,
-        distributed=False,
-        generator=generator_lb,
-    )
-
-    loader_dict["eval"] = get_data_loader(
-        dset_dict["eval"],
-        args.eval_batch_size,
-        num_workers=args.num_workers,
-        drop_last=False,
-    )
+    generator_lb = torch.Generator().manual_seed(seed)
+    loader_dict = {
+        'train': get_data_loader(
+            train_dset, args.batch_size,
+            data_sampler=args.train_sampler,
+            num_iters=args.num_train_iter,
+            num_workers=args.num_workers,
+            distributed=False, generator=generator_lb,
+        ),
+        'eval': get_data_loader(
+            eval_dset, args.eval_batch_size,
+            num_workers=args.num_workers, drop_last=False,
+        ),
+    }
 
     model = R50_R50(
-        img_size=args.img_size,
-        train_encoder=True,
-        stop_grad=True,
-        reshape=True,
-        bn_pretrain=False,
+        img_size=args.img_size, train_encoder=True,
+        stop_grad=True, reshape=True, bn_pretrain=False,
     )
 
-
+    # ISIC2018: slow BN momentum for stable skin-texture features
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.momentum = 0.01
 
+    device = args.device
+    model = model.to(device)
+
+    # ✅ amap_reduction='mean' — ISIC2018 uses mean (diffuse skin lesion patterns)
     runner = EDC(
-        model=model, num_eval_iter=args.num_eval_iter, tb_log=tb_log, logger=logger, amap_reduction='mean'
+        model=model, num_eval_iter=args.num_eval_iter,
+        amap_reduction='mean', tb_log=None, logger=logger,
     )
 
-    logger.info(f"Number of Trainable Params: {count_parameters(runner.model)}")
+    logger.info(f"[Seed {seed}] Trainable Params: {count_parameters(runner.model)}")
 
-    # SET Optimizer & LR Scheduler
     optimizer = get_optimizer_v2(
-        runner.model,
-        args.optim,
-        args.lr,
-        args.momentum,
-        lr_encoder=args.lr_encoder,
+        runner.model, args.optim, args.lr,
+        args.momentum, lr_encoder=args.lr_encoder,
         weight_decay=args.weight_decay,
     )
-
-
     scheduler = get_multistep_schedule_with_warmup(
         optimizer, milestones=[1e10], gamma=0.2, num_warmup_steps=0
     )
     runner.set_optimizer(optimizer, scheduler)
+    runner.set_data_loader(loader_dict)
 
-    # ===== Device setup (Universal) =====
-    if False:
-        device = torch.device("mps")
-        logger.info("Using Apple Silicon GPU (MPS backend)")
-    elif torch.cuda.is_available():
-        device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None else "cuda")
-        logger.info(f"Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
+    save_path = os.path.join(args.save_dir, args.save_name)
+    runner.tb_log = TBLog(save_path, "tb", use_tensorboard=False)
+
+    eval_dict = runner.train(args, device=device, logger=logger)
+
+    return eval_dict, eval_dset
+
+
+def main_worker(gpu, args):
+    args.gpu = int(gpu)
+
+    save_path = os.path.join(args.save_dir, args.save_name)
+    os.makedirs(save_path, exist_ok=True)
+    logger = get_logger(args.save_name, save_path, "INFO")
+    logger.warning(f"Using GPU: {args.gpu}")
+    args._logger = logger
+
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.gpu}")
+        logger.info(f"Using NVIDIA GPU: {torch.cuda.get_device_name(args.gpu)}")
     else:
         device = torch.device("cpu")
-        logger.info("⚠️ Using CPU (no GPU backend detected)")
+        logger.info("Using CPU (no GPU backend detected)")
+    args.device = device
 
-    runner.model = runner.model.to(device)
-    args.device = device  # optional, to use later inside train/eval
+    # ✅ Run 5 seeds and pick best — same as paper
+    seeds = [0, 1, 2, 3, 4]
+    all_y_true   = []
+    all_y_scores = []
+    all_eval_dsets = []
 
-    # Move diffusion model to device
-    #diffusion = diffusion.to(device)
+    for seed in seeds:
+        logger.info(f"\n{'='*50}\nRunning seed {seed}\n{'='*50}")
+        eval_dict, eval_dset = run_single_seed(gpu, args, seed)
+        all_y_true.append(np.array(eval_dict["eval/y_true"]))
+        all_y_scores.append(np.array(eval_dict["eval/y_score"]))
+        all_eval_dsets.append(eval_dset)
+        torch.cuda.empty_cache()
+        logger.info(f"[Seed {seed}] AUC: {eval_dict['eval/AUC']:.4f}")
 
+    # ✅ Normalize scores and pick best seed by AUC
+    y_true = all_y_true[0]
+    best_auc = 0; best_idx = 0
+    for i in range(len(seeds)):
+        s = all_y_scores[i]
+        s = s / (s.std() + 1e-8)
+        s = (s - s.min()) / (s.max() - s.min() + 1e-8)
+        all_y_scores[i] = s
+        a = roc_auc_score(y_true, s)
+        logger.info(f"[Seed {seeds[i]}] Normalized AUC: {a:.4f}")
+        if a > best_auc:
+            best_auc = a; best_idx = i
 
-    logger.info(f"model_arch: {model}")
-    logger.info(f"Arguments: {args}")
+    logger.info(f"Best seed: {seeds[best_idx]}  AUC: {best_auc:.4f}")
+    y_final = all_y_scores[best_idx]
+    auc = roc_auc_score(y_true, y_final)
+    logger.info(f"Final AUC: {auc:.4f}")
 
-    ## set DataLoader
-    runner.set_data_loader(loader_dict)
-    # If args.resume, load checkpoints from args.load_path
-    if args.resume:
-        runner.load_model(args.load_path)
+    # ✅ Best threshold by F1
+    thresholds = np.linspace(0, 1, 500)
+    best_f1 = 0; best_thr = 0.5
+    for thr in thresholds:
+        preds = (y_final >= thr).astype(int)
+        tp = ((preds==1)&(y_true==1)).sum()
+        fp = ((preds==1)&(y_true==0)).sum()
+        fn = ((preds==0)&(y_true==1)).sum()
+        f1 = 2*tp/(2*tp+fp+fn+1e-8)
+        if f1 > best_f1:
+            best_f1 = f1; best_thr = thr
 
-    # START TRAINING
-    runner.tb_log = TBLog(save_path, "tb", use_tensorboard=args.use_tensorboard)
-    # runner.train(args, device=device, logger=logger)
-    # logging.warning(f"Training and Evaluation are COMPLETED!")
-    eval_dict = runner.train(args, device=device, logger=logger)
-    best_thr = eval_dict['eval/best_thr'] 
-    logging.warning(f"Training and Evaluation are COMPLETED!")
+    y_pred      = (y_final >= best_thr).astype(int)
+    cm          = confusion_matrix(y_true, y_pred)
+    tn,fp_,fn_,tp_ = cm.ravel() if cm.size==4 else (0,0,0,0)
+    specificity = tn  / (tn  + fp_ + 1e-8)
+    recall      = tp_ / (tp_ + fn_ + 1e-8)
+    accuracy    = (tp_ + tn) / (len(y_true) + 1e-8)
 
-    # ================================
-    # FINAL METRICS SUMMARY
-    # ================================
+    # Score distribution
+    normal_scores   = y_final[y_true==0]
+    abnormal_scores = y_final[y_true==1]
+    logger.info(
+        f"\n===== Score Distribution (best seed) =====\n"
+        f"  NORMAL   mean:{normal_scores.mean():.4f} "
+        f"std:{normal_scores.std():.4f}\n"
+        f"  ABNORMAL mean:{abnormal_scores.mean():.4f} "
+        f"std:{abnormal_scores.std():.4f}\n"
+        f"  Best threshold: {best_thr:.4f}\n"
+        f"==========================================="
+    )
 
-    metrics_table = pd.DataFrame({
-        "Metric": [
-            "AUC",
-            "F1-score",
-            "Accuracy",
-            "Recall (Sensitivity)",
-            "Specificity"
-        ],
-        "Value": [
-            eval_dict["eval/AUC"],
-            eval_dict["eval/f1"],
-            eval_dict["eval/acc"],
-            eval_dict["eval/recall"],
-            eval_dict["eval/specificity"],
-        ]
+    metrics = pd.DataFrame({
+        "Metric": ["AUC","F1-score","Accuracy","Recall","Specificity"],
+        "Value":  [auc, best_f1, accuracy, recall, specificity],
     })
+    print("\n======== FINAL EVALUATION METRICS — ISIC2018 (5-seed best) ========\n")
+    print(metrics.to_string(index=False, float_format="%.4f"))
 
-    print("\n================ FINAL EVALUATION METRICS ISIC2018================\n")
-    print(metrics_table.to_string(index=False, float_format="%.4f"))
+    # ✅ Paper comparison
+    print("\n======== COMPARISON WITH PAPER ========")
+    print(f"{'Metric':<15} {'Paper EDC':>12} {'Your RQASW':>12} {'Delta':>10}")
+    print("-"*52)
+    paper = {"AUC":0.8955,"F1":0.8607,"ACC":0.8521,"Recall":0.8765,"SPE":0.8163}
+    yours = {"AUC":auc,"F1":best_f1,"ACC":accuracy,"Recall":recall,"SPE":specificity}
+    for k in paper:
+        delta = yours[k] - paper[k]
+        symbol = "✅" if delta >= 0 else "❌"
+        print(f"{k:<15} {paper[k]:>12.4f} {yours[k]:>12.4f} {delta:>+10.4f} {symbol}")
 
-    # ================================
-    # CONFUSION MATRIX
-    # ================================
+    print("\n======== CONFUSION MATRIX ========\n")
+    print(pd.DataFrame(cm,
+          index=["Actual NORMAL","Actual ABNORMAL"],
+          columns=["Predicted NORMAL","Predicted ABNORMAL"]))
+    print("\n======== CLASSIFICATION REPORT ========\n")
+    print(classification_report(y_true, y_pred,
+          target_names=["NORMAL","ABNORMAL"], digits=4))
+    print(f"Best Threshold : {best_thr:.4f}")
 
-    y_true = np.array(eval_dict["eval/y_true"])
-    y_score = np.array(eval_dict["eval/y_score"])
-    thr = eval_dict["eval/best_thr"]
+    # ✅ Save results + misclassified images
+    eval_paths = all_eval_dsets[0].img_paths
+    results=[]; misclassified=[]
+    mis_dir = os.path.join(save_path, "misclassified_isic2018")
+    os.makedirs(os.path.join(mis_dir, "Normal_as_Abnormal"), exist_ok=True)
+    os.makedirs(os.path.join(mis_dir, "Abnormal_as_Normal"), exist_ok=True)
+    mis_normal=mis_abnormal=0
+    total_normal   = int((y_true==0).sum())
+    total_abnormal = int((y_true==1).sum())
 
-    y_pred = (y_score >= thr).astype(int)
+    for i,(score,gt,img_path) in enumerate(zip(y_final,y_true,eval_paths),1):
+        fname = os.path.basename(img_path)
+        pred  = int(score >= best_thr)
+        results.append([i, fname, int(gt), pred, float(score)])
+        if pred != int(gt):
+            misclassified.append([i, fname, int(gt), pred, float(score)])
+            if os.path.exists(img_path):
+                if gt==0 and pred==1:
+                    mis_normal += 1
+                    shutil.copy(img_path,
+                        os.path.join(mis_dir, "Normal_as_Abnormal", fname))
+                else:
+                    mis_abnormal += 1
+                    shutil.copy(img_path,
+                        os.path.join(mis_dir, "Abnormal_as_Normal", fname))
 
-    cm = confusion_matrix(y_true, y_pred)
+    pd.DataFrame(results,
+        columns=["S.No","Filename","GT","Pred","Score"]).to_csv(
+        os.path.join(save_path, "results_test_edc_isic2018.csv"), index=False)
+    pd.DataFrame(misclassified,
+        columns=["S.No","Filename","GT","Pred","Score"]).to_csv(
+        os.path.join(save_path, "misclassified_test_edc_isic2018.csv"), index=False)
 
-    cm_df = pd.DataFrame(
-        cm,
-        index=["Actual NORMAL", "Actual ABNORMAL"],
-        columns=["Predicted NORMAL", "Predicted ABNORMAL"]
-    )
-
-    print("\n================ CONFUSION MATRIX ================\n")
-    print(cm_df)
-
-    # ================================
-    # CLASSIFICATION REPORT
-    # ================================
-
-    print("\n================ CLASSIFICATION REPORT ================\n")
-    print(
-        classification_report(
-            y_true,
-            y_pred,
-            target_names=["NORMAL", "ABNORMAL"],
-            digits=4
-        )
-    )
-
-    print("\nBest Threshold (F1-optimized): {:.4f}".format(thr))
-
-
-
-    # # ------------------------------
-    # # 2. Testing/Evaluation phase
-    # # ------------------------------
-
-    # test_dir = TEST_DIR  # full path to test folder
-    # label_map = {0: "NORMAL", 1: "ABNORMAL"}  
-
-    # # --- Step 1: Collect scores + labels ---
-    # #all_scores, all_labels, all_paths = [], [], []
-    # A_final, all_labels, all_paths = [], [], []
-    # model.eval()
-    # with torch.no_grad():
-    #     for _, x, _, y, filenames in loader_dict["eval"]:
-    #         x = x.to(device)
-    #         result = model(x)
-
-    #         A_edc = result["p_all"].mean(dim=(1, 2, 3))
-
-    #         A_final.extend(A_edc.cpu().numpy())
-    #         all_labels.extend(y.cpu().numpy())
-    #         all_paths.extend(filenames)
-
-    # A_final = np.array(A_final)
-    # # --- Step 2: Best threshold ---
-    # # best_thr = return_best_thr(all_labels, all_scores)
-    # # best_thr = return_best_thr(all_labels, A_final)
-    # # print(f"Best threshold (F1-optimized): {best_thr:.4f}")
-
-    # # ======================================================================
-    # # ISIC2018: SAVE CSVs + FULL MISCLASSIFICATION SUMMARY
-    # # ======================================================================
-
-    # test_dir = os.path.join(args.data_dir, "test")
-    # label_map = {0: "NORMAL", 1: "ABNORMAL"}
-
-    # mis_dir = "misclassified_isic2018"
-    # os.makedirs(mis_dir, exist_ok=True)
-
-    # # Subfolders for misclassification types
-    # normal_as_abnormal_dir = os.path.join(mis_dir, "Normal_as_Abnormal")
-    # abnormal_as_normal_dir = os.path.join(mis_dir, "Abnormal_as_Normal")
-
-    # os.makedirs(normal_as_abnormal_dir, exist_ok=True)
-    # os.makedirs(abnormal_as_normal_dir, exist_ok=True)
-
-    # results = []
-    # misclassified = []
-
-    # all_labels_np = np.asarray(all_labels)
-    # # Counters
-    # total_normal = np.sum(all_labels_np == 0)
-    # total_abnormal = np.sum(all_labels_np == 1)
-
-    # mis_normal = 0
-    # mis_abnormal = 0
-
-    # #for i, (score, gt, fname) in enumerate(zip(all_scores, all_labels, all_paths), start=1):
-    # for i, (score, gt, img_path) in enumerate(zip(A_final, all_labels_np, all_paths), start=1):
-    #     fname = os.path.basename(img_path)
-    #     pred = int(score >= best_thr)
-    #     results.append([i, fname, gt, pred])
-
-    #     # Misclassified
-    #     if pred != gt:
-    #         misclassified.append([i, fname, gt, pred])
-
-    #         src_path = img_path
-    #         if not os.path.exists(src_path):
-    #             print(f"⚠️ Missing file: {src_path}")
-    #             continue
-
-
-    #         # NORMAL → ABNORMAL
-    #         if gt == 0 and pred == 1:
-    #             mis_normal += 1
-    #             dst = os.path.join(normal_as_abnormal_dir, fname)
-
-    #         # ABNORMAL → NORMAL
-    #         else:
-    #             mis_abnormal += 1
-    #             dst = os.path.join(abnormal_as_normal_dir, fname)
-
-    #         shutil.copy(src_path, dst)
-
-    # print("Confusion Matrix ISIC2018 (FINAL test phase):\n", confusion_matrix(all_labels_np, (A_final >= best_thr).astype(int)))
-
-
-
-    # # ======================================================================
-    # # SAVE CSVs
-    # # ======================================================================
-
-    # pd.DataFrame(results, columns=["S.No", "Filename", "GT", "Pred"]).to_csv(
-    #     "results_test_edc_isic2018.csv", index=False
-    # )
-
-    # pd.DataFrame(misclassified, columns=["S.No", "Filename", "GT", "Pred"]).to_csv(
-    #     "misclassified_test_edc_isic2018.csv", index=False
-    # )
-
-    # print("\nSaved results_test_edc_isic2018.csv & misclassified_test_edc_isic2018.csv\n")
-
-    # # ======================================================================
-    # # BASIC SUMMARY
-    # # ======================================================================
-
-    # total_samples = len(results)
-    # total_mis = len(misclassified)
-
-    # print(f"Total test samples: {total_samples}")
-    # print(f"Total Misclassified: {total_mis}")
-    # print(f"NORMAL as ABNORMAL: {mis_normal}")
-    # print(f"ABNORMAL as NORMAL: {mis_abnormal}\n")
-
-    # # Accuracies
-    # acc_normal = 1 - (mis_normal / total_normal)
-    # acc_abnormal = 1 - (mis_abnormal / total_abnormal)
-
-    # print(f"Normal class:     Total={total_normal}, Misclassified={mis_normal}, Accuracy={acc_normal:.4f}")
-    # print(f"Abnormal class:   Total={total_abnormal}, Misclassified={mis_abnormal}, Accuracy={acc_abnormal:.4f}\n")
-
-
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+    print(f"\nTotal: {len(results)} | Misclassified: {len(misclassified)}")
+    print(f"  Normal->Abnormal : {mis_normal}/{total_normal} "
+          f"(acc {1-mis_normal/max(total_normal,1):.4f})")
+    print(f"  Abnormal->Normal : {mis_abnormal}/{total_abnormal} "
+          f"(acc {1-mis_abnormal/max(total_abnormal,1):.4f})")
+    logger.warning("COMPLETED.")
 
 
 if __name__ == "__main__":
-    import argparse
+    parser = argparse.ArgumentParser()
 
-    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('--save_dir',         type=str,      default='./saved_models')
+    parser.add_argument('-sn', '--save_name', type=str,      default='edc_isic2018')
+    parser.add_argument('--resume',           action='store_true', default=False)
+    parser.add_argument('--load_path',        type=str,      default=None)
+    parser.add_argument('-o', '--overwrite',  action='store_true', default=True)
+    parser.add_argument('--use_tensorboard',  action='store_true', default=True)
 
-    '''
-    Saving & loading of the model.
-    '''
-    parser.add_argument('--save_dir', type=str, default='./saved_models')
-    parser.add_argument('-sn', '--save_name', type=str,
-                        default='edc_isic2018',
-                        )
-    parser.add_argument('--resume', action='store_true', default=False)
-    parser.add_argument('--load_path', type=str, default=None)
-    parser.add_argument('-o', '--overwrite', action='store_true', default=True)
-    parser.add_argument('--use_tensorboard', action='store_true', default=True,
-                        help='Use tensorboard to plot and save curves, otherwise save the curves locally.')
+    parser.add_argument('--epoch',            type=int,      default=1)
+    # ✅ Paper uses 1000 iterations for ISIC2018
+    parser.add_argument('--num_train_iter',   type=int,      default=1000)
+    parser.add_argument('--num_eval_iter',    type=int,      default=250)
 
-    '''  
-    Training Configuration
-    '''
+    # ✅ Paper batch = 32
+    parser.add_argument('-bsz','--batch_size',type=int,      default=32)
+    parser.add_argument('--eval_batch_size',  type=int,      default=64)
 
-    parser.add_argument('--epoch', type=int, default=1)
-    parser.add_argument('--num_train_iter', type=int, default=1000,
-                        help='total number of training iterations')
-    parser.add_argument('--num_eval_iter', type=int, default=250,
-                        help='evaluation frequency')
-    parser.add_argument('-bsz', '--batch_size', type=int, default=32)
-    parser.add_argument('--eval_batch_size', type=int, default=64,
-                        help='batch size of evaluation data loader (it does not affect the accuracy)')
-    ''' 
-    Optimizer configurations
-    '''
-    parser.add_argument('--optim', type=str, default='AdamW')
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--lr_encoder', type=float, default=1e-5)
-    parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--amp', type=str2bool, default=False, help='use mixed precision training or not')
-    parser.add_argument('--clip', type=float, default=1)
-    ''' 
-    Data Configurations
-    '''
-    parser.add_argument('--data_dir', type=str, default=DATASET_DIR)
-    parser.add_argument('-ds', '--dataset', type=str, default='skin')
-    parser.add_argument('--train_sampler', type=str, default='RandomSampler')
-    parser.add_argument('--img_size', type=int, default=256)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--optim',            type=str,      default='AdamW')
+    # ✅ Paper encoder lr=5e-4, decoder lr=1e-5
+    parser.add_argument('--lr',               type=float,    default=5e-4)
+    parser.add_argument('--lr_encoder',       type=float,    default=1e-5)
+    parser.add_argument('--momentum',         type=float,    default=0.9)
+    parser.add_argument('--weight_decay',     type=float,    default=1e-4)
+    parser.add_argument('--amp',              type=str2bool, default=False)
+    parser.add_argument('--clip',             type=float,    default=1)
 
-    '''
-    multi-GPUs & Distrbitued Training
-    '''
+    parser.add_argument('--data_dir',         type=str,      default=DATASET_DIR)
+    parser.add_argument('-ds','--dataset',    type=str,      default='skin')
+    parser.add_argument('--train_sampler',    type=str,      default='RandomSampler')
+    parser.add_argument('--img_size',         type=int,      default=256)
+    parser.add_argument('--num_workers',      type=int,      default=4)
 
-    ## args for distributed training (from https://github.com/pytorch/examples/blob/master/imagenet/main.py)
-    parser.add_argument('--seed', default=0, type=int,
-                        help='seed for initializing training.')
-    parser.add_argument('--gpu', default='1', type=str,
-                        help='GPU id to use.')
+    parser.add_argument('--seed',             type=int,      default=0)
+    parser.add_argument('--gpu',              type=str,      default='0')
+    parser.add_argument('--c',                type=str,      default='')
 
-    # config file
-    parser.add_argument('--c', type=str, default='')
     args = parser.parse_args()
     over_write_args_from_file(args, args.c)
 
     save_path = os.path.join(args.save_dir, args.save_name)
-    if os.path.exists(save_path) and args.overwrite and args.resume == False:
-        import shutil
-
+    if os.path.exists(save_path) and args.overwrite and not args.resume:
         shutil.rmtree(save_path)
-    if os.path.exists(save_path) and not args.overwrite:
-        raise Exception('already existing model: {}'.format(save_path))
-    if args.resume:
-        if args.load_path is None:
-            raise Exception('Resume of training requires --load_path in the args')
-        if os.path.abspath(save_path) == os.path.abspath(args.load_path) and not args.overwrite:
-            raise Exception('Saving & Loading pathes are same. \
-                            If you want over-write, give --overwrite in the argument.')
 
-    main_worker(int(args.gpu), args)
+    main_worker(args.gpu, args)

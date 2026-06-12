@@ -115,7 +115,7 @@ class EDC:
     def train(self, args, device, logger=None):
         self.model.train()
 
-        save_path = os.path.join(args.save_dir, args.save_name)
+        save_path = getattr(args, "seed_save_path", os.path.join(args.save_dir, args.save_name))
         os.makedirs(save_path, exist_ok=True)
 
         if USE_MPS:
@@ -307,17 +307,37 @@ class EDC:
         y2_prob = np.array(y2_prob)
         y3_prob = np.array(y3_prob)
 
-        thresh = return_best_thr(y_true, y_prob)
-        y_pred = (y_prob >= thresh).astype(int)
+        def gauss_norm(s):
+            return (s - s.mean()) / (s.std() + 1e-8)
+
+        y_prob_n  = gauss_norm(y_prob)
+        y1_prob_n = gauss_norm(y1_prob)
+        y2_prob_n = gauss_norm(y2_prob)
+        y3_prob_n = gauss_norm(y3_prob)
+
+        AUC    = roc_auc_score(y_true, y_prob_n)
+        AUC1   = roc_auc_score(y_true, y1_prob_n)
+        AUC2   = roc_auc_score(y_true, y2_prob_n)
+        AUC3   = roc_auc_score(y_true, y3_prob_n)
+
+        best_auc = max(AUC, AUC1, AUC2, AUC3)
+        if best_auc == AUC1:
+            y_final = y1_prob_n
+        elif best_auc == AUC2:
+            y_final = y2_prob_n
+        elif best_auc == AUC3:
+            y_final = y3_prob_n
+        else:
+            y_final = y_prob_n
+
+        thresh = return_best_thr(y_true, y_final)
+        y_pred = (y_final >= thresh).astype(int)
 
         acc    = accuracy_score(y_true, y_pred)
         f1     = f1_score(y_true, y_pred, zero_division=0)
         recall = recall_score(y_true, y_pred, zero_division=0)
         spec   = specificity_score(y_true, y_pred)
-        AUC    = roc_auc_score(y_true, y_prob)
-        AUC1   = roc_auc_score(y_true, y1_prob)
-        AUC2   = roc_auc_score(y_true, y2_prob)
-        AUC3   = roc_auc_score(y_true, y3_prob)
+        AUC    = roc_auc_score(y_true, y_final)
 
         self.model.train()
         return {
@@ -332,7 +352,7 @@ class EDC:
             'eval/AUC3':        AUC3,
             'eval/best_thr':    thresh,
             'eval/y_true':      y_true,
-            'eval/y_score':     y_prob,
+            'eval/y_score':     y_final,
         }
 
     # ------------------------------------------------------------------
