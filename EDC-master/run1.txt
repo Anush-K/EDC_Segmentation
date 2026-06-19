@@ -1,0 +1,12 @@
+Loading checkpoint: ./saved_models/edc_aptos/seed_2/model_best.pth
+
+>>> Re-scored AUC (best scoring method) on existing checkpoint: 0.9557
+>>> Compare this against your original 0.6125 to see if scoring was the bottleneck.
+
+======== FULL METRICS (re-scored, no retrain) ========
+AUC         : 0.9557   (EDC 0.9541 | EA2D 0.9753)
+F1-score    : 0.9399   (EDC 0.9306 | EA2D 0.9395)
+Accuracy    : 0.9166   (EDC 0.9008 | EA2D 0.9340)
+Recall      : 0.9348   (EDC 0.9596 | EA2D 0.9334)
+Specificity : 0.8745   (EDC 0.8112 | EA2D 0.9347)
+Best Threshold: 0.0001

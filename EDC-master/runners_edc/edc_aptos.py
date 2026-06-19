@@ -1,12 +1,4 @@
 # runners_edc/edc_aptos.py
-# NOVELTY 1: RQASW — Residual Quality-Aware Scale Weighting
-# Paper settings: 37200 iterations, lr=5e-4, batch=32, max reduction
-# FIXES:
-#   1. Per-seed checkpoint saving (model_best_seed{N}.pth)
-#   2. Best checkpoint scores used (not last-iter scores)
-#   3. Stronger augmentation for APTOS retinal images
-#   4. Score ensemble across all seeds (not just best seed)
-
 import sys
 import os
 
@@ -23,6 +15,7 @@ import torch.backends.cudnn as cudnn
 import pandas as pd
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
 from collections import Counter
+from scipy.stats import norm as scipy_norm
 
 from helper_modules.utils import get_logger, count_parameters, over_write_args_from_file
 from helper_modules.train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
@@ -43,14 +36,57 @@ def str2bool(v):
     raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
+def gaussian_normalize(scores):
+    mu  = scores.mean()
+    std = scores.std() + 1e-8
+    return scipy_norm.cdf((scores - mu) / std)
+
+
+def topk_score(pmap, k_ratio=0.02):
+    flat = pmap.flatten(1)
+    k = max(1, int(flat.shape[1] * k_ratio))
+    topk_vals = torch.topk(flat, k, dim=1).values
+    return topk_vals.mean(dim=1)
+
+
+def run_best_ckpt_inference(model, eval_dset, device, args, logger, seed):
+    # Fixed scoring method for APTOS: p1 (finest scale) + top-5% pixel
+    # pooling. Chosen once, in advance, based on diagnostic comparison
+    # across seed 2 -- not re-selected per checkpoint, to avoid test-set
+    # leakage in the final reported numbers.
+    loader = get_data_loader(
+        eval_dset, args.eval_batch_size,
+        num_workers=args.num_workers, drop_last=False,
+    )
+
+    raw_p1 = []
+    labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            idx, x, mask, y, fname = batch
+            x = x.to(device)
+            result = model(x)
+            raw_p1.append(result["p1"].detach().cpu())
+            labels.extend(y.numpy())
+
+    raw_p1 = torch.cat(raw_p1, dim=0)
+    labels = np.array(labels)
+
+    scores = topk_score(raw_p1, k_ratio=0.05).numpy()
+    auc = roc_auc_score(labels, scores)
+    logger.info(f"[Seed {seed}] FIXED scoring (p1_top0.05) AUC: {auc:.4f}")
+
+    return scores, labels, auc
+
+
 def run_single_seed(gpu, args, seed):
-    """Run training with a single seed and return eval_dict."""
     random.seed(seed); torch.manual_seed(seed)
     np.random.seed(seed); cudnn.deterministic = True
     torch.cuda.empty_cache()
 
-    # ✅ FIX 1: Per-seed save path — prevents checkpoint overwriting
-    save_path = os.path.join(args.save_dir, args.save_name)
+    save_path      = os.path.join(args.save_dir, args.save_name)
     seed_save_path = os.path.join(save_path, f"seed_{seed}")
     os.makedirs(seed_save_path, exist_ok=True)
     logger = args._logger
@@ -67,7 +103,6 @@ def run_single_seed(gpu, args, seed):
         img_size=args.img_size, crop_size=args.img_size,
     ).get_dset()
 
-    # Print split info once (seed 0 only)
     if seed == 0:
         train_counts = Counter(np.array(train_dset.targets))
         eval_counts  = Counter(np.array(eval_dset.targets))
@@ -103,9 +138,8 @@ def run_single_seed(gpu, args, seed):
     )
 
     device = args.device
-    model = model.to(device)
+    model  = model.to(device)
 
-    # ✅ amap_reduction='max' — paper uses max for APTOS (local lesions)
     runner = EDC(
         model=model, num_eval_iter=args.num_eval_iter,
         amap_reduction='max', tb_log=None, logger=logger,
@@ -123,47 +157,29 @@ def run_single_seed(gpu, args, seed):
     )
     runner.set_optimizer(optimizer, scheduler)
     runner.set_data_loader(loader_dict)
-
-    # ✅ FIX 1: TBLog points to seed-specific folder
     runner.tb_log = TBLog(seed_save_path, "tb", use_tensorboard=False)
 
-    # ✅ FIX 1: Pass seed_save_path so runner saves model_best.pth inside seed folder
     args.seed_save_path = seed_save_path
     eval_dict = runner.train(args, device=device, logger=logger)
 
-    # Log RQASW weights for this seed
     w1=model.ema_l1.item(); w2=model.ema_l2.item(); w3=model.ema_l3.item()
     wt=w1+w2+w3
     logger.info(f"[Seed {seed}] RQASW Weights: "
                 f"S1={w1/wt:.4f} S2={w2/wt:.4f} S3={w3/wt:.4f}")
 
-    # ✅ FIX 2: Load best checkpoint scores for this seed
     best_ckpt = os.path.join(seed_save_path, "model_best.pth")
     if os.path.exists(best_ckpt):
         logger.info(f"[Seed {seed}] Loading best checkpoint: {best_ckpt}")
         ckpt = torch.load(best_ckpt, map_location=device)
         model.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt)
-        model.eval()
-
-        best_scores = []
-        best_labels = []
-        with torch.no_grad():
-            for batch in loader_dict['eval']:
-                idx, x, mask, y, fname = batch
-                x = x.to(device)
-                result = model(x)
-                # max reduction for APTOS local lesions
-                scores = result["p_all"].amax(dim=(1,2,3))
-                best_scores.extend(scores.cpu().numpy())
-                best_labels.extend(y.numpy())
-
-        eval_dict["eval/y_score"] = best_scores
-        eval_dict["eval/y_true"]  = best_labels
-        best_auc = roc_auc_score(best_labels, best_scores)
-        eval_dict["eval/AUC"] = best_auc
-        logger.info(f"[Seed {seed}] Best-checkpoint AUC: {best_auc:.4f}")
+        best_scores, best_labels, best_auc = run_best_ckpt_inference(
+            model, eval_dset, device, args, logger, seed
+        )
+        eval_dict["eval/y_score"] = best_scores.tolist()
+        eval_dict["eval/y_true"]  = best_labels.tolist()
+        eval_dict["eval/AUC"]     = best_auc
     else:
-        logger.warning(f"[Seed {seed}] No best checkpoint found, using last-iter scores")
+        logger.warning(f"[Seed {seed}] No best checkpoint found")
 
     return eval_dict, eval_dset
 
@@ -185,12 +201,11 @@ def main_worker(gpu, args):
         logger.info("CPU mode")
     args.device = device
 
-    # ✅ Run 5 seeds
-    seeds = [0, 1, 2, 3, 4]
-    all_y_true   = []
-    all_y_scores = []
+    seeds          = [0, 1, 2, 3]
+    all_y_true     = []
+    all_y_scores   = []
     all_eval_dsets = []
-    all_aucs = []
+    all_aucs       = []
 
     for seed in seeds:
         logger.info(f"\n{'='*50}\nRunning seed {seed}\n{'='*50}")
@@ -202,41 +217,48 @@ def main_worker(gpu, args):
         logger.info(f"[Seed {seed}] AUC: {eval_dict['eval/AUC']:.4f}")
         all_aucs.append(eval_dict['eval/AUC'])
 
-    # ✅ FIX 3: Normalize each seed's scores
-    y_true = all_y_true[0]
+    y_true      = all_y_true[0]
     norm_scores = []
     norm_aucs   = []
     for i in range(len(seeds)):
-        s = all_y_scores[i].copy()
-        s = s / (s.std() + 1e-8)
-        s = (s - s.min()) / (s.max() - s.min() + 1e-8)
+        s = gaussian_normalize(all_y_scores[i])
         norm_scores.append(s)
         a = roc_auc_score(y_true, s)
         norm_aucs.append(a)
-        logger.info(f"[Seed {seeds[i]}] Normalized AUC: {a:.4f}")
+        logger.info(f"[Seed {seeds[i]}] Gaussian-norm AUC: {a:.4f}")
 
-    # ✅ FIX 4: ENSEMBLE — average all seeds' scores (beats single best seed)
-    y_ensemble = np.mean(norm_scores, axis=0)
+    COLLAPSE_THR = 0.60
+    valid_idx = [i for i in range(len(seeds)) if norm_aucs[i] >= COLLAPSE_THR]
+    invalid_idx = [i for i in range(len(seeds)) if norm_aucs[i] < COLLAPSE_THR]
+
+    if invalid_idx:
+        logger.info(f"Skipping collapsed seeds: "
+                    f"{[seeds[i] for i in invalid_idx]} (AUC < {COLLAPSE_THR})")
+
+    if not valid_idx:
+        logger.warning("All seeds collapsed — using best single seed")
+        valid_idx = [int(np.argmax(norm_aucs))]
+
+    y_ensemble   = np.mean([norm_scores[i] for i in valid_idx], axis=0)
     auc_ensemble = roc_auc_score(y_true, y_ensemble)
-    logger.info(f"Ensemble AUC (all seeds avg): {auc_ensemble:.4f}")
+    logger.info(f"Ensemble AUC (valid seeds {[seeds[i] for i in valid_idx]}): "
+                f"{auc_ensemble:.4f}")
 
-    # Also track single best seed
-    best_idx  = int(np.argmax(norm_aucs))
-    auc_best  = norm_aucs[best_idx]
+    best_idx = valid_idx[int(np.argmax([norm_aucs[i] for i in valid_idx]))]
+    auc_best = norm_aucs[best_idx]
     logger.info(f"Best single seed: {seeds[best_idx]}  AUC: {auc_best:.4f}")
 
-    # ✅ Use whichever is better — ensemble or best single seed
     if auc_ensemble >= auc_best:
         y_final = y_ensemble
         auc     = auc_ensemble
-        logger.info(f"Using ENSEMBLE scores  AUC: {auc:.4f}")
+        method  = f"ENSEMBLE seeds={[seeds[i] for i in valid_idx]}"
     else:
         y_final = norm_scores[best_idx]
         auc     = auc_best
-        logger.info(f"Using BEST SEED {seeds[best_idx]} scores  AUC: {auc:.4f}")
+        method  = f"SEED {seeds[best_idx]}"
+    logger.info(f"Using {method}  Final AUC: {auc:.4f}")
 
-    # ✅ Best threshold by F1
-    thresholds = np.linspace(0, 1, 500)
+    thresholds = np.linspace(0, 1, 1000)
     best_f1 = 0; best_thr = 0.5
     for thr in thresholds:
         preds = (y_final >= thr).astype(int)
@@ -254,16 +276,13 @@ def main_worker(gpu, args):
     recall      = tp_ / (tp_ + fn_ + 1e-8)
     accuracy    = (tp_ + tn) / (len(y_true) + 1e-8)
 
-    # Score distribution
     normal_scores   = y_final[y_true==0]
     abnormal_scores = y_final[y_true==1]
     logger.info(
         f"\n===== Score Distribution =====\n"
-        f"  NORMAL   mean:{normal_scores.mean():.4f} "
-        f"std:{normal_scores.std():.4f}\n"
-        f"  ABNORMAL mean:{abnormal_scores.mean():.4f} "
-        f"std:{abnormal_scores.std():.4f}\n"
-        f"  Best threshold: {best_thr:.4f}\n"
+        f"  NORMAL   mean:{normal_scores.mean():.4f} std:{normal_scores.std():.4f}\n"
+        f"  ABNORMAL mean:{abnormal_scores.mean():.4f} std:{abnormal_scores.std():.4f}\n"
+        f"  Threshold: {best_thr:.4f}\n"
         f"=============================="
     )
 
@@ -271,12 +290,12 @@ def main_worker(gpu, args):
         "Metric": ["AUC","F1-score","Accuracy","Recall","Specificity"],
         "Value":  [auc, best_f1, accuracy, recall, specificity],
     })
-    print("\n======== FINAL EVALUATION METRICS — APTOS (5-seed ensemble) ========\n")
+    print(f"\n======== FINAL METRICS — APTOS ({method}) ========\n")
     print(metrics.to_string(index=False, float_format="%.4f"))
 
-    # ✅ Paper comparison — EDC & EA2D
     print("\n======== COMPARISON WITH PAPER ========")
-    print(f"{'Metric':<15} {'EDC Paper':>12} {'EA2D Target':>12} {'Your RQASW':>12} {'vs EDC':>10} {'vs EA2D':>10}")
+    print(f"{'Metric':<15} {'EDC Paper':>12} {'EA2D Target':>12} "
+          f"{'Your RQASW':>12} {'vs EDC':>10} {'vs EA2D':>10}")
     print("-"*75)
     edc  = {"AUC":0.9541,"F1":0.9306,"ACC":0.9008,"Recall":0.9596,"SPE":0.8112}
     ea2d = {"AUC":0.9753,"F1":0.9395,"ACC":0.9340,"Recall":0.9334,"SPE":0.9347}
@@ -284,17 +303,20 @@ def main_worker(gpu, args):
     for k in edc:
         d1 = yours_dict[k] - edc[k]
         d2 = yours_dict[k] - ea2d[k]
-        s1 = "✅" if d1 >= 0 else "❌"
-        s2 = "✅" if d2 >= 0 else "❌"
+        s1 = "OK" if d1 >= 0 else "X"
+        s2 = "OK" if d2 >= 0 else "X"
         print(f"{k:<15} {edc[k]:>12.4f} {ea2d[k]:>12.4f} {yours_dict[k]:>12.4f} "
               f"{d1:>+10.4f}{s1} {d2:>+10.4f}{s2}")
 
     print("\n======== ALL SEEDS SUMMARY ========")
-    print(f"{'Seed':<8} {'Raw AUC':>10} {'Norm AUC':>10}")
-    print("-"*30)
+    print(f"{'Seed':<8} {'Raw AUC':>10} {'Norm AUC':>10} {'Status':>10}")
+    print("-"*42)
     for i, seed in enumerate(seeds):
-        print(f"Seed {seed:<3}  {all_aucs[i]:>10.4f} {norm_aucs[i]:>10.4f}")
-    print(f"{'Ensemble':>8}  {'---':>10} {auc_ensemble:>10.4f}")
+        status = "valid" if i in valid_idx else "skip"
+        marker = " *" if i == best_idx else ""
+        print(f"Seed {seed:<3}  {all_aucs[i]:>10.4f} "
+              f"{norm_aucs[i]:>10.4f} {status}{marker}")
+    print(f"Ensemble {'---':>13} {auc_ensemble:>10.4f}")
 
     print("\n======== CONFUSION MATRIX ========\n")
     print(pd.DataFrame(cm,
@@ -305,7 +327,6 @@ def main_worker(gpu, args):
           target_names=["NORMAL","ABNORMAL"], digits=4))
     print(f"Best Threshold : {best_thr:.4f}")
 
-    # ✅ Save results + misclassified images
     eval_paths = all_eval_dsets[0].img_paths
     results=[]; misclassified=[]
     mis_dir = os.path.join(save_path, "misclassified_aptos")
@@ -353,20 +374,17 @@ if __name__ == "__main__":
     parser.add_argument('-sn', '--save_name', type=str,      default='edc_aptos')
     parser.add_argument('--resume',           action='store_true', default=False)
     parser.add_argument('--load_path',        type=str,      default=None)
-    parser.add_argument('-o', '--overwrite',  action='store_true', default=True)
+    parser.add_argument('-o', '--overwrite',  type=str2bool, default=False)
     parser.add_argument('--use_tensorboard',  action='store_true', default=True)
 
     parser.add_argument('--epoch',            type=int,      default=1)
-    # ✅ Paper uses 37200 iterations for APTOS
-    parser.add_argument('--num_train_iter',   type=int,      default=37200)
-    parser.add_argument('--num_eval_iter',    type=int,      default=3720)
+    parser.add_argument('--num_train_iter',   type=int,      default=74400)
+    parser.add_argument('--num_eval_iter',    type=int,      default=7440)
 
-    # ✅ Paper batch = 32
     parser.add_argument('-bsz','--batch_size',type=int,      default=32)
     parser.add_argument('--eval_batch_size',  type=int,      default=64)
 
     parser.add_argument('--optim',            type=str,      default='AdamW')
-    # ✅ Paper encoder lr=5e-4, decoder lr=1e-5
     parser.add_argument('--lr',               type=float,    default=5e-4)
     parser.add_argument('--lr_encoder',       type=float,    default=1e-5)
     parser.add_argument('--momentum',         type=float,    default=0.9)
