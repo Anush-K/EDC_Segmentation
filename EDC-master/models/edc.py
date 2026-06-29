@@ -95,6 +95,7 @@ class R50_R50(nn.Module):
         anomap_layer=[1, 2, 3],
         var_reg_weight=0.04,
         ema_momentum=0.99,
+        use_rqasw=True,
     ):
         super().__init__()
         self.edc_encoder    = resnet50(pretrained=True)
@@ -106,6 +107,14 @@ class R50_R50(nn.Module):
         self.anomap_layer   = anomap_layer
         self.var_reg_weight = var_reg_weight
         self.ema_momentum   = ema_momentum
+        # ✅ NOVELTY 1 TOGGLE: use_rqasw=False reverts fusion to the
+        # original EDC paper's fixed equal-weight mean across scales.
+        # EMA buffers still update either way (harmless bookkeeping),
+        # but only feed into the actual fusion weights when True. This
+        # lets "Baseline EDC" and "Your RQASW" runs share identical
+        # encoder/decoder/training code, differing ONLY in this one
+        # fusion step — the cleanest possible ablation.
+        self.use_rqasw      = use_rqasw
 
         # RQASW: EMA loss buffers (non-trainable)
         self.register_buffer('ema_l1', torch.tensor(1.0))
@@ -182,7 +191,14 @@ class R50_R50(nn.Module):
             self.ema_l2 = m * self.ema_l2 + (1.0 - m) * l2.detach()
             self.ema_l3 = m * self.ema_l3 + (1.0 - m) * l3.detach()
 
-        w      = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        # ✅ use_rqasw toggle: when False, fusion reverts to the original
+        # EDC paper's fixed equal-weight mean — same encoder/decoder/loss,
+        # only this fusion step differs. EMA buffers still update above
+        # regardless (harmless), they just don't drive p_all when off.
+        if self.use_rqasw:
+            w = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        else:
+            w = torch.ones(3, device=x.device) / 3.0
         p_maps = [p1, p2_up, p3_up]
         selected = [p_maps[l - 1] for l in self.anomap_layer]
         w_sel    = torch.stack([w[l - 1] for l in self.anomap_layer])
@@ -231,6 +247,7 @@ class WR50_WR50(nn.Module):
         anomap_layer=[1, 2, 3],
         var_reg_weight=0.04,
         ema_momentum=0.99,
+        use_rqasw=True,
     ):
         super().__init__()
         self.edc_encoder    = wide_resnet50_2(pretrained=True)
@@ -242,6 +259,7 @@ class WR50_WR50(nn.Module):
         self.anomap_layer   = anomap_layer
         self.var_reg_weight = var_reg_weight
         self.ema_momentum   = ema_momentum
+        self.use_rqasw      = use_rqasw
 
         self.register_buffer('ema_l1', torch.tensor(1.0))
         self.register_buffer('ema_l2', torch.tensor(1.0))
@@ -306,7 +324,11 @@ class WR50_WR50(nn.Module):
             self.ema_l2 = m * self.ema_l2 + (1.0 - m) * l2.detach()
             self.ema_l3 = m * self.ema_l3 + (1.0 - m) * l3.detach()
 
-        w     = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        # ✅ use_rqasw toggle — see R50_R50 for full explanation
+        if self.use_rqasw:
+            w = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        else:
+            w = torch.ones(3, device=x.device) / 3.0
         sel   = [([p1, p2_up, p3_up])[l - 1] for l in self.anomap_layer]
         w_sel = torch.stack([w[l - 1] for l in self.anomap_layer])
         w_sel = w_sel / w_sel.sum()

@@ -130,6 +130,7 @@ class EDC:
         start_batch.record()
         best_eval_auc = 0.0
         best_it       = 0
+        best_eval_dict = None
         scaler        = GradScaler()
         train_log     = []
 
@@ -214,6 +215,7 @@ class EDC:
                 if tb_dict['eval/AUC'] > best_eval_auc:
                     best_eval_auc = tb_dict['eval/AUC']
                     best_it       = self.it
+                    best_eval_dict = dict(eval_dict)
                     self.save_model('model_best.pth', save_path)
                     self.print_fn(f"  -> New best AUC: {best_eval_auc:.4f} — checkpoint saved.")
 
@@ -247,6 +249,15 @@ class EDC:
         self.generate_heatmaps(device, args)
 
         eval_dict.update({'eval/best_auc': best_eval_auc, 'eval/best_it': best_it})
+        if best_eval_dict is not None:
+            eval_dict.update({
+                'eval/best_y_true':      best_eval_dict['eval/y_true'],
+                'eval/best_y_score':     best_eval_dict['eval/y_score'],
+                'eval/best_f1':          best_eval_dict['eval/f1'],
+                'eval/best_recall':      best_eval_dict['eval/recall'],
+                'eval/best_specificity': best_eval_dict['eval/specificity'],
+                'eval/best_acc':         best_eval_dict['eval/acc'],
+            })
         return eval_dict
 
     # ------------------------------------------------------------------
@@ -320,15 +331,26 @@ class EDC:
         AUC2   = roc_auc_score(y_true, y2_prob_n)
         AUC3   = roc_auc_score(y_true, y3_prob_n)
 
-        best_auc = max(AUC, AUC1, AUC2, AUC3)
-        if best_auc == AUC1:
-            y_final = y1_prob_n
-        elif best_auc == AUC2:
-            y_final = y2_prob_n
-        elif best_auc == AUC3:
-            y_final = y3_prob_n
-        else:
+        # FIX: previously always picked whichever of {ensemble, M1, M2,
+        # M3} had the HIGHEST AUC ON THE TEST SET ITSELF -- a form of
+        # test-set leakage, since it uses test labels to choose among
+        # 4 candidate scoring methods. The paper's actual method (Sec.
+        # III-A, Eq. 2) is a FIXED ensemble of M1+M2+M3, no per-checkpoint
+        # selection among layers. self.paper_faithful_eval (default True)
+        # uses the fixed ensemble, matching the paper exactly. Set to
+        # False to restore the old (leaky) argmax behavior for comparison.
+        if getattr(self, 'paper_faithful_eval', True):
             y_final = y_prob_n
+        else:
+            best_auc = max(AUC, AUC1, AUC2, AUC3)
+            if best_auc == AUC1:
+                y_final = y1_prob_n
+            elif best_auc == AUC2:
+                y_final = y2_prob_n
+            elif best_auc == AUC3:
+                y_final = y3_prob_n
+            else:
+                y_final = y_prob_n
 
         thresh = return_best_thr(y_true, y_final)
         y_pred = (y_final >= thresh).astype(int)

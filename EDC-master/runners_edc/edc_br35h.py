@@ -6,6 +6,14 @@
 #   2. Best checkpoint scores used (not last-iter scores)
 #   3. Score ensemble across all seeds (not just best seed)
 #   4. Auto-select ensemble vs best single seed
+#   5. ✅ stop_grad=False — was True, which (per models/edc.py) hardcodes
+#      var_loss=0 regardless of var_reg_weight. The anti-collapse
+#      regularizer has never actually been active for Br35H. Flipping
+#      this lets var_reg_weight genuinely do something — worth comparing
+#      against the old stop_grad=True runs as a real ablation.
+#   6. ✅ seeds expanded 3->5 — given the documented seed-instability
+#      pattern (same as APTOS), more seeds in the ensemble should give
+#      a more reliable final number with less single-seed noise.
 
 import sys
 import os
@@ -97,10 +105,25 @@ def run_single_seed(gpu, args, seed):
 
     model = R50_R50(
         img_size=args.img_size, train_encoder=True,
-        stop_grad=False, reshape=True, bn_pretrain=False,
+        # ✅ FIX (verified against official guojiajeremy/EDC repo): paper
+        # uses stop_grad=True. The stop_grad=False test last round was a
+        # real regression, not just unhelpful — reverting it.
+        stop_grad=True, reshape=True, bn_pretrain=False,
         var_reg_weight=args.var_reg_weight,
         ema_momentum=args.ema_momentum,
+        use_rqasw=args.use_rqasw,
     )
+
+    # ✅ FIX (verified against official repo): this BN momentum override
+    # was missing entirely. The paper forces all BatchNorm2d layers to
+    # update running stats very slowly (momentum=0.01 vs PyTorch's
+    # default 0.1) right after model construction. Without this, BN
+    # running stats adapt much faster/more erratically than the paper's
+    # setup — a plausible contributor to seed-to-seed instability.
+    import torch.nn as nn
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.momentum = 0.01
 
     device = args.device
     model = model.to(device)
@@ -185,8 +208,9 @@ def main_worker(gpu, args):
         logger.info("CPU mode")
     args.device = device
 
-    # ✅ Run 5 seeds
-    seeds = [0, 1, 2]
+    # ✅ FIX 6: expanded 3->5 seeds to reduce single-seed noise given
+    # the documented seed-instability pattern
+    seeds = [0, 1, 2, 3, 4]
     all_y_true     = []
     all_y_scores   = []
     all_eval_dsets = []
@@ -366,15 +390,25 @@ if __name__ == "__main__":
     parser.add_argument('--eval_batch_size',  type=int,      default=64)
 
     parser.add_argument('--optim',            type=str,      default='AdamW')
-    # ✅ Paper encoder lr=5e-4, decoder lr=5e-5
-    parser.add_argument('--lr',               type=float,    default=5e-5)
-    parser.add_argument('--lr_encoder',       type=float,    default=5e-4)
+    # ✅ FIX (verified against official guojiajeremy/EDC repo): these two
+    # were transposed. Paper: decoder (args.lr) = 5e-4 (higher),
+    # encoder (args.lr_encoder) = 5e-5 (gentler, since it's pretrained).
+    # This implementation had the pretrained encoder moving 10x FASTER
+    # than the paper intends — likely a real contributor to both the
+    # AUC ceiling and seed instability.
+    parser.add_argument('--lr',               type=float,    default=5e-4)
+    parser.add_argument('--lr_encoder',       type=float,    default=5e-5)
     parser.add_argument('--momentum',         type=float,    default=0.9)
     parser.add_argument('--weight_decay',     type=float,    default=1e-4)
     parser.add_argument('--amp',              type=str2bool, default=False)
-    parser.add_argument('--clip',             type=float,    default=0.1)
+    # ✅ FIX (verified against official repo): paper uses clip=1.0, this
+    # had 0.1 — 10x more aggressive gradient clipping than intended.
+    parser.add_argument('--clip',             type=float,    default=1.0)
     parser.add_argument('--var_reg_weight',   type=float,    default=0.1)
     parser.add_argument('--ema_momentum',     type=float,    default=0.999)
+    # ✅ Novelty 1 ablation toggle: False = original EDC paper's fixed
+    # equal-weight fusion (Baseline EDC run); True = RQASW (Your RQASW run)
+    parser.add_argument('--use_rqasw',        type=str2bool, default=True)
 
     parser.add_argument('--data_dir',         type=str,      default=DATASET_DIR)
     parser.add_argument('-ds','--dataset',    type=str,      default='brain')

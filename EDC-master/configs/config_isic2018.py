@@ -35,7 +35,7 @@ if ENV == "colab":
 else:
     # Local: assuming config.py is at:
     #   APTOS_EDC/EDC-master/config_aptos.py
-    BASE_DIR = "/home/cs24d0008/EDC_SSL"
+    BASE_DIR = "/home/cs24d0008/EDC_Segmentation"
 
 
 # --------------------------------------------------

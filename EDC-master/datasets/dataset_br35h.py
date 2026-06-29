@@ -50,6 +50,12 @@ class AD_Dataset(Dataset):
 
         # --------------------------------------------------
         # TRANSFORMS
+        # Run A: clean paper-replication — only the two genuine bugs
+        # (ImageNet normalization, bn_pretrain) stay fixed. No per-image
+        # intensity normalization, no augmentation — those are separate
+        # hypotheses to test AFTER confirming whether the runner-level
+        # fixes (lr/lr_encoder swap, stop_grad, clip, BN momentum) alone
+        # close the gap.
         # --------------------------------------------------
         self.transform = transforms.Compose([
 
@@ -64,6 +70,19 @@ class AD_Dataset(Dataset):
                 std=[0.229, 0.224, 0.225]
             ),
 
+        ])
+
+        # --------------------------------------------------
+        # ✅ FIX (kept): separate transform with NO normalization, used
+        # only to produce a viewable image for heatmap overlays. This
+        # doesn't affect training/AUC at all — it only fixes the
+        # previously-broken (all-black) heatmap visualizations.
+        # --------------------------------------------------
+        self.vis_transform = transforms.Compose([
+            transforms.Resize(
+                (img_size, img_size)
+            ),
+            transforms.ToTensor(),
         ])
 
         self.img_paths = []
@@ -148,31 +167,24 @@ class AD_Dataset(Dataset):
         # --------------------------------------------------
         # LOAD IMAGE
         # --------------------------------------------------
-        image = Image.open(img_path).convert('RGB')
+        pil_image = Image.open(img_path).convert('RGB')
 
-        image = self.transform(image)
+        image = self.transform(pil_image)
 
         # --------------------------------------------------
-        # DUMMY MASK FOR EDC COMPATIBILITY
-        # Shape: (1, H, W)
+        # ✅ FIX (kept): real (resized, un-normalized) image for
+        # visualization, replacing the old all-zero dummy_mask.
         # --------------------------------------------------
-        dummy_mask = torch.zeros(
-            (
-                1,
-                image.shape[1],
-                image.shape[2]
-            ),
-            dtype=torch.float32
-        )
+        image_vis = self.vis_transform(pil_image)
 
         # --------------------------------------------------
         # EDC FORMAT
-        # idx, image, gt_mask, label, filename
+        # idx, image, image_vis (for overlay), label, filename
         # --------------------------------------------------
         return (
             idx,
             image,
-            dummy_mask,
+            image_vis,
             label,
             filename
         )

@@ -94,6 +94,7 @@ def run_single_seed(gpu, args, seed):
     model = R50_R50(
         img_size=args.img_size, train_encoder=True,
         stop_grad=True, reshape=True, bn_pretrain=False,
+        use_rqasw=args.use_rqasw,
     )
 
     # ISIC2018: slow BN momentum for stable skin-texture features
@@ -293,8 +294,10 @@ if __name__ == "__main__":
 
     parser.add_argument('--epoch',            type=int,      default=1)
     # ✅ Paper uses 1000 iterations for ISIC2018
-    parser.add_argument('--num_train_iter',   type=int,      default=1000)
-    parser.add_argument('--num_eval_iter',    type=int,      default=250)
+    # ✅ FIX (verified against official guojiajeremy/EDC repo, edc_isic.py):
+    # was 1000/250 — paper's save-name fingerprint confirms "i5h" = 500.
+    parser.add_argument('--num_train_iter',   type=int,      default=500)
+    parser.add_argument('--num_eval_iter',    type=int,      default=100)
 
     # ✅ Paper batch = 32
     parser.add_argument('-bsz','--batch_size',type=int,      default=32)
@@ -302,12 +305,16 @@ if __name__ == "__main__":
 
     parser.add_argument('--optim',            type=str,      default='AdamW')
     # ✅ Paper encoder lr=5e-4, decoder lr=1e-5
-    parser.add_argument('--lr',               type=float,    default=5e-4)
+    # ✅ FIX (verified against official repo): paper uses lr=1e-4, not 5e-4.
+    parser.add_argument('--lr',               type=float,    default=1e-4)
     parser.add_argument('--lr_encoder',       type=float,    default=1e-5)
     parser.add_argument('--momentum',         type=float,    default=0.9)
     parser.add_argument('--weight_decay',     type=float,    default=1e-4)
     parser.add_argument('--amp',              type=str2bool, default=False)
     parser.add_argument('--clip',             type=float,    default=1)
+    # ✅ Novelty 1 ablation toggle: False = original EDC paper's fixed
+    # equal-weight fusion (Baseline EDC run); True = RQASW (Your RQASW run)
+    parser.add_argument('--use_rqasw',        type=str2bool, default=True)
 
     parser.add_argument('--data_dir',         type=str,      default=DATASET_DIR)
     parser.add_argument('-ds','--dataset',    type=str,      default='skin')

@@ -17,6 +17,7 @@ class AD_Dataset(Dataset):
         img_size=256,
         crop_size=256,
         train_samples_limit=10000,
+        imagenet_norm=True,
     ):
 
         self.train = train
@@ -43,26 +44,40 @@ class AD_Dataset(Dataset):
                 'NORMAL'
             )
 
-            self.abnormal_root = os.path.join(
-                data_dir,
-                'test',
-                'ABNORMAL'
-            )
+            # FIX: OCT2017's raw official structure has 3 separate
+            # disease-class folders (CNV, DME, DRUSEN), not a single
+            # pre-merged ABNORMAL folder. Confirmed against
+            # config_oct2017.py's own documented layout -- this dataset
+            # is never run through a prepare_*.py merge script.
+            self.abnormal_roots = [
+                os.path.join(data_dir, 'test', 'CNV'),
+                os.path.join(data_dir, 'test', 'DME'),
+                os.path.join(data_dir, 'test', 'DRUSEN'),
+            ]
 
         # --------------------------------------------------
         # TRANSFORMS
-        # No imagenet norm — OCT2017 uses raw pixel distribution
+        # FIX: official edc_oct.py never overrides imagenet_norm, so it
+        # uses the shared dataset.py default (imagenet_norm=True).
+        # Confirmed via official repo grep -- OCT2017 IS normalized,
+        # same as every other dataset. The prior "raw pixel distribution"
+        # comment was unverified and incorrect.
         # No center crop — resize directly to img_size
         # --------------------------------------------------
-        self.transform = transforms.Compose([
-
-            transforms.Resize(
-                (img_size, img_size)
-            ),
-
+        transform_list = [
+            transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
+        ]
 
-        ])
+        if imagenet_norm:
+            transform_list.append(
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                )
+            )
+
+        self.transform = transforms.Compose(transform_list)
 
         self.img_paths = []
         self.targets   = []
@@ -117,24 +132,26 @@ class AD_Dataset(Dataset):
                     self.targets.append(0)
 
             # --------------------------------------------------
-            # TEST ABNORMAL
+            # TEST ABNORMAL (CNV + DME + DRUSEN combined)
             # --------------------------------------------------
-            for file in sorted(
-                os.listdir(self.abnormal_root)
-            ):
+            for abnormal_root in self.abnormal_roots:
 
-                if file.lower().endswith(
-                    ('.png', '.jpg', '.jpeg')
+                for file in sorted(
+                    os.listdir(abnormal_root)
                 ):
 
-                    self.img_paths.append(
-                        os.path.join(
-                            self.abnormal_root,
-                            file
-                        )
-                    )
+                    if file.lower().endswith(
+                        ('.png', '.jpg', '.jpeg')
+                    ):
 
-                    self.targets.append(1)
+                        self.img_paths.append(
+                            os.path.join(
+                                abnormal_root,
+                                file
+                            )
+                        )
+
+                        self.targets.append(1)
 
     def __len__(self):
 
