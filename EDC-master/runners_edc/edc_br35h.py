@@ -396,8 +396,8 @@ if __name__ == "__main__":
     # This implementation had the pretrained encoder moving 10x FASTER
     # than the paper intends — likely a real contributor to both the
     # AUC ceiling and seed instability.
-    parser.add_argument('--lr',               type=float,    default=5e-4)
-    parser.add_argument('--lr_encoder',       type=float,    default=5e-5)
+    parser.add_argument('--lr',               type=float,    default=0.0005)
+    parser.add_argument('--lr_encoder',       type=float,    default=5e-05)
     parser.add_argument('--momentum',         type=float,    default=0.9)
     parser.add_argument('--weight_decay',     type=float,    default=1e-4)
     parser.add_argument('--amp',              type=str2bool, default=False)

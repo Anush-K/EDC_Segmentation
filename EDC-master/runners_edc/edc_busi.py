@@ -132,7 +132,7 @@ def run_single_seed(gpu, args, seed):
 
     model = R50_R50(
         img_size=args.img_size, train_encoder=True,
-        stop_grad=args.stop_grad, reshape=True, bn_pretrain=False,
+        stop_grad=args.stop_grad, reshape=True, bn_pretrain=True,
         var_reg_weight=args.var_reg_weight,
         ema_momentum=args.ema_momentum,
         use_rqasw=args.use_rqasw,
@@ -172,6 +172,17 @@ def run_single_seed(gpu, args, seed):
     wt = w1 + w2 + w3
     logger.info(f"[Seed {seed}] RQASW Weights: "
                 f"S1={w1/wt:.4f} S2={w2/wt:.4f} S3={w3/wt:.4f}")
+
+    # Move heatmaps from top-level into seed subfolder so each seed's
+    # heatmaps are preserved. edc1.py always writes to
+    # saved_models/<name>/heatmap/ regardless of seed_save_path.
+    top_heatmap_dir  = os.path.join(args.save_dir, args.save_name, 'heatmap')
+    seed_heatmap_dir = os.path.join(seed_save_path, 'heatmap')
+    if os.path.exists(top_heatmap_dir):
+        if os.path.exists(seed_heatmap_dir):
+            shutil.rmtree(seed_heatmap_dir)
+        shutil.move(top_heatmap_dir, seed_heatmap_dir)
+        logger.info(f"[Seed {seed}] Heatmaps moved -> {seed_heatmap_dir}")
 
     best_ckpt = os.path.join(seed_save_path, "model_best.pth")
     if os.path.exists(best_ckpt):
@@ -264,6 +275,23 @@ def main_worker(gpu, args):
         y_final = norm_scores[best_idx]
         auc     = auc_best
         logger.info(f"Using BEST SEED {seeds[best_idx]} scores  AUC: {auc:.4f}")
+
+    # Copy best seed's heatmaps to top-level heatmap/ so that
+    # generate_seg_dataset scripts find them at the expected path.
+    best_seed_hm = os.path.join(
+        args.save_dir, args.save_name,
+        f"seed_{seeds[best_idx]}", "heatmap"
+    )
+    top_hm = os.path.join(args.save_dir, args.save_name, 'heatmap')
+    if os.path.exists(best_seed_hm):
+        if os.path.exists(top_hm):
+            shutil.rmtree(top_hm)
+        shutil.copytree(best_seed_hm, top_hm)
+        logger.info(f"Best-seed heatmaps (seed {seeds[best_idx]}) "
+                    f"copied -> {top_hm}")
+    else:
+        logger.warning(f"No heatmap folder found for best seed {seeds[best_idx]}"
+                       f" at {best_seed_hm}")
 
     thresholds = np.linspace(0, 1, 500)
     best_f1 = 0; best_thr = 0.5
@@ -380,9 +408,10 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay',     type=float,    default=1e-4)
     parser.add_argument('--amp',              type=str2bool, default=False)
     parser.add_argument('--clip',             type=float,    default=1.0)
-    # CHANGED: was 1.0 ("very strong variance push"), now 0.1 for
-    # cross-dataset consistency. Pass --var_reg_weight 1.0 to restore.
-    parser.add_argument('--var_reg_weight',   type=float,    default=0.1)
+    # BUSI-specific: restored to original 1.0 ("strong variance push").
+    # The cross-dataset 0.1 default caused score collapse with bn_pretrain=True
+    # and BUSI's low-LR regime. Pass --var_reg_weight 0.1 to test the lower value.
+    parser.add_argument('--var_reg_weight',   type=float,    default=1.0)
     parser.add_argument('--ema_momentum',     type=float,    default=0.999)
     parser.add_argument('--use_rqasw',        type=str2bool, default=True)
     # See header note: default False keeps var_reg_weight active.

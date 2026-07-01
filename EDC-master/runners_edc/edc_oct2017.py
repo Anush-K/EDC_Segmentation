@@ -117,6 +117,8 @@ def run_single_seed(gpu, args, seed):
         amap_reduction='max', tb_log=None, logger=logger,
     )
 
+    runner.use_tta_flip = True  # TTA: average with horizontal-flip prediction
+    runner.use_tta_flip = True  # TTA: average with horizontal-flip prediction
     logger.info(f"[Seed {seed}] Trainable Params: {count_parameters(runner.model)}")
 
     optimizer = get_optimizer_v2(
@@ -156,7 +158,7 @@ def main_worker(gpu, args):
     args.device = device
 
     # ✅ Run 5 seeds and pick best — same as paper
-    seeds = [0, 1, 2, 3, 4]
+    seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     all_y_true   = []
     all_y_scores = []
     all_eval_dsets = []
@@ -403,8 +405,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--optim',              type=str,      default='AdamW')
     # ✅ Paper encoder lr=5e-4, decoder lr=1e-5
-    parser.add_argument('--lr',                 type=float,    default=5e-4)
-    parser.add_argument('--lr_encoder',         type=float,    default=1e-5)
+    parser.add_argument('--lr',                 type=float,    default=0.0005)
+    parser.add_argument('--lr_encoder',         type=float,    default=1e-05)
     parser.add_argument('--momentum',           type=float,    default=0.9)
     parser.add_argument('--weight_decay',       type=float,    default=1e-4)
     parser.add_argument('--amp',                type=str2bool, default=False)

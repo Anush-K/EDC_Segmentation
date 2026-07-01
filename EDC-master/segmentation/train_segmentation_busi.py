@@ -142,9 +142,11 @@ def run_experiment(use_hgbl, tag=''):
     ti,vi = random_split(range(n),[nt,nv],generator=gen)
 
     tl = DataLoader(Subset(full,ti.indices), BATCH_SIZE, shuffle=True,
-                    num_workers=4, pin_memory=True, drop_last=False)
+                    num_workers=2, pin_memory=True, drop_last=False,
+                    persistent_workers=True)
     vl = DataLoader(Subset(full,vi.indices), BATCH_SIZE, shuffle=False,
-                    num_workers=4, pin_memory=True, drop_last=False)
+                    num_workers=2, pin_memory=True, drop_last=False,
+                    persistent_workers=True)
 
     model = UNet(in_channels=4, dropout_p=0.3).to(DEVICE)
     opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)

@@ -1,31 +1,23 @@
-# runners_edc/edc_busi.py
+# runners_edc/edc_lgg.py
 # NOVELTY 1: RQASW — Residual Quality-Aware Scale Weighting
 #
-# No official base paper exists for BUSI in the EDC paper. This runner
+# No official base paper exists for LGG in the EDC paper. This runner
 # is conformed to the same verified template used for the paper-grounded
 # datasets (Br35H/OCT2017/ISIC2018/APTOS) for consistency:
 #   - 5-seed run, per-seed checkpoint saving, best-checkpoint reload
 #   - Score ensembling across seeds (auto-picks ensemble vs best seed)
+#   - var_reg_weight=0.1 / ema_momentum=0.999 (paper-verified combo)
 #   - bn_pretrain=False (paper convention)
 #   - use_rqasw ablation toggle exposed
-#   - var_reg_weight changed 1.0 -> 0.1 to match the cross-dataset
-#     standard (was a deliberate BUSI-specific "very strong variance
-#     push" choice — pass --var_reg_weight 1.0 to restore it).
-#   - lr / lr_encoder left UNCHANGED (5e-5 / 1e-5). This was already a
-#     deliberately different, lower-LR regime for BUSI, not the same
-#     "encoder moving too fast" bug fixed in COVID-19/LGG/Kvasir.
+#   - lr_encoder corrected to 5e-5 (was 1e-4 — same "encoder moving 10x
+#     too fast" bug flagged and fixed in Br35H's comments)
 #   - stop_grad kept at False (default), NOT aligned to the paper's True.
 #     Per the official repo, stop_grad=True hardcodes var_loss=0 inside
 #     the model, which would silently disable var_reg_weight entirely.
 #     Pass --stop_grad true if you want to ablate the paper's literal
 #     setting instead.
-#   - Iteration count auto-scales to dataset size, unified to the same
-#     50-epoch target as COVID-19/LGG/Kvasir (previously 200 epochs here
-#     specifically — now consistent).
-#   - The old one-off post-hoc "temperature scaling" block (single-seed
-#     min-max rescale) has been retired: the 5-seed normalize+ensemble
-#     pipeline below supersedes it with a more robust version of the
-#     same idea.
+#   - Iteration count auto-scales to dataset size (50-epoch target),
+#     unified with COVID-19/BUSI/Kvasir (previously 10 epochs here).
 
 import sys
 import os
@@ -48,10 +40,10 @@ from collections import Counter
 from helper_modules.utils import get_logger, count_parameters, over_write_args_from_file
 from helper_modules.train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
 from methods.edc1 import EDC
-from datasets.dataset_busi import AD_Dataset
+from datasets.dataset_lgg import AD_Dataset
 from datasets.data_utils import get_data_loader
 from models.edc import R50_R50
-from configs.config_busi import DATASET_DIR
+from configs.config_lgg import DATASET_DIR
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -100,8 +92,8 @@ def run_single_seed(gpu, args, seed):
                     f"Abnormal: {eval_counts.get(1,0)}")
 
         # Conformed iteration policy — unified to the same 50-epoch
-        # target used across COVID-19/LGG/Kvasir (previously 200 epochs
-        # specifically for BUSI).
+        # target used across COVID-19/BUSI/Kvasir (previously 10 epochs
+        # specifically for LGG).
         n_train = len(train_dset)
         iters_per_epoch   = max(1, n_train // args.batch_size)
         target_epochs     = 50
@@ -145,7 +137,7 @@ def run_single_seed(gpu, args, seed):
     device = args.device
     model = model.to(device)
 
-    # amap_reduction='mean' kept as previously used for BUSI
+    # amap_reduction='mean' kept as previously used for LGG
     runner = EDC(
         model=model, num_eval_iter=args.num_eval_iter,
         amap_reduction='mean', tb_log=None, logger=logger,
@@ -172,6 +164,17 @@ def run_single_seed(gpu, args, seed):
     wt = w1 + w2 + w3
     logger.info(f"[Seed {seed}] RQASW Weights: "
                 f"S1={w1/wt:.4f} S2={w2/wt:.4f} S3={w3/wt:.4f}")
+
+    # Move heatmaps from top-level into seed subfolder so each seed's
+    # heatmaps are preserved. edc1.py always writes to
+    # saved_models/<name>/heatmap/ regardless of seed_save_path.
+    top_heatmap_dir  = os.path.join(args.save_dir, args.save_name, 'heatmap')
+    seed_heatmap_dir = os.path.join(seed_save_path, 'heatmap')
+    if os.path.exists(top_heatmap_dir):
+        if os.path.exists(seed_heatmap_dir):
+            shutil.rmtree(seed_heatmap_dir)
+        shutil.move(top_heatmap_dir, seed_heatmap_dir)
+        logger.info(f"[Seed {seed}] Heatmaps moved -> {seed_heatmap_dir}")
 
     best_ckpt = os.path.join(seed_save_path, "model_best.pth")
     if os.path.exists(best_ckpt):
@@ -265,6 +268,23 @@ def main_worker(gpu, args):
         auc     = auc_best
         logger.info(f"Using BEST SEED {seeds[best_idx]} scores  AUC: {auc:.4f}")
 
+    # Copy best seed's heatmaps to top-level heatmap/ so that
+    # generate_seg_dataset scripts find them at the expected path.
+    best_seed_hm = os.path.join(
+        args.save_dir, args.save_name,
+        f"seed_{seeds[best_idx]}", "heatmap"
+    )
+    top_hm = os.path.join(args.save_dir, args.save_name, 'heatmap')
+    if os.path.exists(best_seed_hm):
+        if os.path.exists(top_hm):
+            shutil.rmtree(top_hm)
+        shutil.copytree(best_seed_hm, top_hm)
+        logger.info(f"Best-seed heatmaps (seed {seeds[best_idx]}) "
+                    f"copied -> {top_hm}")
+    else:
+        logger.warning(f"No heatmap folder found for best seed {seeds[best_idx]}"
+                       f" at {best_seed_hm}")
+
     thresholds = np.linspace(0, 1, 500)
     best_f1 = 0; best_thr = 0.5
     for thr in thresholds:
@@ -299,7 +319,7 @@ def main_worker(gpu, args):
         "Metric": ["AUC", "F1-score", "Accuracy", "Recall", "Specificity"],
         "Value":  [auc, best_f1, accuracy, recall, specificity],
     })
-    print("\n======== FINAL EVALUATION METRICS — BUSI (5-seed ensemble) ========\n")
+    print("\n======== FINAL EVALUATION METRICS — LGG (5-seed ensemble) ========\n")
     print(metrics.to_string(index=False, float_format="%.4f"))
 
     print("\n======== ALL SEEDS SUMMARY ========")
@@ -320,7 +340,7 @@ def main_worker(gpu, args):
 
     eval_paths = all_eval_dsets[0].img_paths
     results = []; misclassified = []
-    mis_dir = os.path.join(save_path, "misclassified_busi")
+    mis_dir = os.path.join(save_path, "misclassified_lgg")
     os.makedirs(os.path.join(mis_dir, "Normal_as_Abnormal"), exist_ok=True)
     os.makedirs(os.path.join(mis_dir, "Abnormal_as_Normal"), exist_ok=True)
     mis_normal = mis_abnormal = 0
@@ -342,9 +362,9 @@ def main_worker(gpu, args):
                     shutil.copy(img_path, os.path.join(mis_dir, "Abnormal_as_Normal", fname))
 
     pd.DataFrame(results, columns=["S.No", "Filename", "GT", "Pred", "Score"]).to_csv(
-        os.path.join(save_path, "results_test_edc_busi.csv"), index=False)
+        os.path.join(save_path, "results_test_edc_lgg.csv"), index=False)
     pd.DataFrame(misclassified, columns=["S.No", "Filename", "GT", "Pred", "Score"]).to_csv(
-        os.path.join(save_path, "misclassified_test_edc_busi.csv"), index=False)
+        os.path.join(save_path, "misclassified_test_edc_lgg.csv"), index=False)
 
     print(f"\nTotal: {len(results)} | Misclassified: {len(misclassified)}")
     print(f"  Normal->Abnormal : {mis_normal}/{total_normal} "
@@ -358,7 +378,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--save_dir',         type=str,      default='./saved_models')
-    parser.add_argument('-sn', '--save_name', type=str,      default='edc_busi')
+    parser.add_argument('-sn', '--save_name', type=str,      default='edc_lgg')
     parser.add_argument('--resume',           action='store_true', default=False)
     parser.add_argument('--load_path',        type=str,      default=None)
     parser.add_argument('-o', '--overwrite',  action='store_true', default=True)
@@ -368,20 +388,18 @@ if __name__ == "__main__":
     parser.add_argument('--num_train_iter',   type=int,      default=3000)
     parser.add_argument('--num_eval_iter',    type=int,      default=500)
 
-    parser.add_argument('-bsz', '--batch_size', type=int,    default=8)
-    parser.add_argument('--eval_batch_size',  type=int,      default=16)
+    parser.add_argument('-bsz', '--batch_size', type=int,    default=32)
+    parser.add_argument('--eval_batch_size',  type=int,      default=64)
 
     parser.add_argument('--optim',            type=str,      default='AdamW')
-    # Left unchanged — BUSI's own deliberate lower-LR regime, not the
-    # encoder/decoder ratio bug fixed in COVID-19/LGG/Kvasir.
-    parser.add_argument('--lr',               type=float,    default=5e-5)
-    parser.add_argument('--lr_encoder',       type=float,    default=1e-5)
+    parser.add_argument('--lr',               type=float,    default=5e-4)
+    # FIX: was 1e-4 (only 5x slower than decoder lr) — Br35H's verified
+    # fix established encoder lr should be ~10x slower than decoder lr.
+    parser.add_argument('--lr_encoder',       type=float,    default=5e-5)
     parser.add_argument('--momentum',         type=float,    default=0.9)
     parser.add_argument('--weight_decay',     type=float,    default=1e-4)
     parser.add_argument('--amp',              type=str2bool, default=False)
     parser.add_argument('--clip',             type=float,    default=1.0)
-    # CHANGED: was 1.0 ("very strong variance push"), now 0.1 for
-    # cross-dataset consistency. Pass --var_reg_weight 1.0 to restore.
     parser.add_argument('--var_reg_weight',   type=float,    default=0.1)
     parser.add_argument('--ema_momentum',     type=float,    default=0.999)
     parser.add_argument('--use_rqasw',        type=str2bool, default=True)
@@ -389,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument('--stop_grad',        type=str2bool, default=False)
 
     parser.add_argument('--data_dir',         type=str,      default=DATASET_DIR)
-    parser.add_argument('-ds', '--dataset',   type=str,      default='busi')
+    parser.add_argument('-ds', '--dataset',   type=str,      default='lgg_mri')
     parser.add_argument('--train_sampler',    type=str,      default='RandomSampler')
     parser.add_argument('--img_size',         type=int,      default=256)
     parser.add_argument('--num_workers',      type=int,      default=4)

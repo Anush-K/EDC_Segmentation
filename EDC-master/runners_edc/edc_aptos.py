@@ -306,8 +306,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--optim',              type=str,      default='AdamW')
     # ✅ Paper encoder lr=5e-4, decoder lr=1e-5
-    parser.add_argument('--lr',                 type=float,    default=5e-4)
-    parser.add_argument('--lr_encoder',         type=float,    default=1e-5)
+    parser.add_argument('--lr',                 type=float,    default=0.0005)
+    parser.add_argument('--lr_encoder',         type=float,    default=1e-05)
     parser.add_argument('--momentum',           type=float,    default=0.9)
     parser.add_argument('--weight_decay',       type=float,    default=1e-4)
     parser.add_argument('--amp',                type=str2bool, default=False)
