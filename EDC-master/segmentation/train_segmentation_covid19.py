@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
 from tqdm import tqdm
 
-from dataset_covid19_seg import COVID19SegDataset
+from dataset_covid19 import COVID19SegDataset
 from unet import UNet
 
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"

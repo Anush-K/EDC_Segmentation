@@ -62,7 +62,7 @@ class AD_Dataset(Dataset):
         ])
 
         self.img_paths = []
-        self.targets   = []
+        self.targets = []
 
         # --------------------------------------------------
         # TRAIN NORMAL IMAGES
@@ -110,7 +110,6 @@ class AD_Dataset(Dataset):
 
             # --------------------------------------------------
             # TEST ABNORMAL
-            # (includes COVID-19, Lung_Opacity, Viral Pneumonia)
             # --------------------------------------------------
             for file in sorted(
                 os.listdir(self.abnormal_root)
@@ -137,7 +136,7 @@ class AD_Dataset(Dataset):
 
         img_path = self.img_paths[idx]
 
-        label    = self.targets[idx]
+        label = self.targets[idx]
 
         filename = os.path.basename(img_path)
 

@@ -154,6 +154,7 @@ def main_worker(gpu, args):
     seeds = [0, 1, 2, 3, 4]
     all_y_true   = []
     all_y_scores = []
+    all_y1_scores, all_y2_scores, all_y3_scores = [], [], []
     all_eval_dsets = []
 
     for seed in seeds:
@@ -161,6 +162,9 @@ def main_worker(gpu, args):
         eval_dict, eval_dset = run_single_seed(gpu, args, seed)
         all_y_true.append(np.array(eval_dict["eval/y_true"]))
         all_y_scores.append(np.array(eval_dict["eval/y_score"]))
+        all_y1_scores.append(np.array([eval_dict["eval/AUC1"]]))
+        all_y2_scores.append(np.array([eval_dict["eval/AUC2"]]))
+        all_y3_scores.append(np.array([eval_dict["eval/AUC3"]]))
         all_eval_dsets.append(eval_dset)
         torch.cuda.empty_cache()
         logger.info(f"[Seed {seed}] AUC: {eval_dict['eval/AUC']:.4f}")
@@ -182,6 +186,7 @@ def main_worker(gpu, args):
     y_final = all_y_scores[best_idx]
     auc = roc_auc_score(y_true, y_final)
     logger.info(f"Final AUC: {auc:.4f}")
+    logger.info(f"Per-scale AUC (best seed) — M1: {all_y1_scores[best_idx][0]:.4f} | M2: {all_y2_scores[best_idx][0]:.4f} | M3: {all_y3_scores[best_idx][0]:.4f}")
 
     # ✅ Best threshold by F1
     thresholds = np.linspace(0, 1, 500)
