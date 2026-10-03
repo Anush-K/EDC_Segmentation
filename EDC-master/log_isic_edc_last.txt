@@ -1,0 +1,51 @@
+[2026-09-29 12:39:36,084 WARNING] Using GPU: 1
+[2026-09-29 12:39:36,088 INFO] Using NVIDIA GPU: Quadro P2000
+[2026-09-29 12:39:36,088 INFO] 
+==================================================
+Running seed 0
+==================================================
+[2026-09-29 12:39:36,148 INFO] === Train Split ===
+[2026-09-29 12:39:36,148 INFO] Total: 6705  Normal: 6705  Abnormal: 0
+[2026-09-29 12:39:36,149 INFO] === Eval/Test Split ===
+[2026-09-29 12:39:36,149 INFO] Total: 193  Normal: 123  Abnormal: 70
+[2026-09-29 12:39:38,161 INFO] [Seed 0] Trainable Params: 50079528
+[2026-09-29 12:39:38,163 INFO] [!] data loader keys: dict_keys(['train', 'eval'])
+[dataset_isic2018.py] TRAIN loaded: 6705 normal (expected 6705) [OK]
+[dataset_isic2018.py] TEST loaded: 123 normal / 70 abnormal (expected 97/96) [MISMATCH]
+  0%|          | 0/500 [00:00<?, ?it/s]  0%|          | 0/500 [00:01<?, ?it/s]
+Traceback (most recent call last):
+  File "runners_edc/edc_isic2018.py", line 366, in <module>
+    main_worker(args.gpu, args)
+  File "runners_edc/edc_isic2018.py", line 160, in main_worker
+    eval_dict, eval_dset = run_single_seed(gpu, args, seed)
+  File "runners_edc/edc_isic2018.py", line 130, in run_single_seed
+    eval_dict = runner.train(args, device=device, logger=logger)
+  File "/home/cs24d0008/EDC_Segmentation/EDC-master/methods/edc1.py", line 162, in train
+    result     = self.model(x)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/cs24d0008/EDC_Segmentation/EDC-master/models/edc.py", line 145, in forward
+    d1, d2, d3 = self.edc_decoder(e4)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/cs24d0008/EDC_Segmentation/EDC-master/models/resnet_decoder.py", line 171, in forward
+    f1 = self.layer1(f2)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/container.py", line 139, in forward
+    input = module(input)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/cs24d0008/EDC_Segmentation/EDC-master/models/resnet_decoder.py", line 107, in forward
+    identity = self.shortcut(x)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/container.py", line 139, in forward
+    input = module(input)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1130, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/conv.py", line 457, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+  File "/home/cs24d0008/miniconda3/lib/python3.8/site-packages/torch/nn/modules/conv.py", line 453, in _conv_forward
+    return F.conv2d(input, weight, bias, self.stride,
+RuntimeError: CUDA out of memory. Tried to allocate 26.00 MiB (GPU 1; 4.94 GiB total capacity; 4.12 GiB already allocated; 11.12 MiB free; 4.24 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF

@@ -349,3 +349,17 @@ class WR50_WR50(nn.Module):
             'scale_w1': w[0].detach(), 'scale_w2': w[1].detach(),
             'scale_w3': w[2].detach(),
         }
+
+# ---- B1 control experiments (inactive unless RQASW_MODE is set) ----
+import os as _os
+_b1_orig = _adaptive_weights
+def _adaptive_weights(ema_l1, ema_l2, ema_l3, eps=1e-6):
+    w = _b1_orig(ema_l1, ema_l2, ema_l3, eps)
+    m = _os.environ.get('RQASW_MODE', '')
+    if m == 'inverse':
+        inv = 1.0 / w.clamp(min=eps)
+        return inv / inv.sum()
+    if m == 'random':
+        r = torch.tensor([0.081, 0.687, 0.233], device=w.device, dtype=w.dtype)
+        return r / r.sum()
+    return w

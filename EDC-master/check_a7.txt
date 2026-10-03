@@ -1,0 +1,108 @@
+=== A. models/edc.py lines 180-215
+            p1 = 1. - torch.cosine_similarity(d1, e1, dim=1).unsqueeze(1)
+            p2 = 1. - torch.cosine_similarity(d2, e2, dim=1).unsqueeze(1)
+            p3 = 1. - torch.cosine_similarity(d3, e3, dim=1).unsqueeze(1)
+
+        p2_up = F.interpolate(p2, scale_factor=2,  mode='bilinear', align_corners=False)
+        p3_up = F.interpolate(p3, scale_factor=4,  mode='bilinear', align_corners=False)
+
+        # ---- NOVELTY 1: RQASW adaptive fusion ---------------------------
+        if self.training:
+            m = self.ema_momentum
+            self.ema_l1 = m * self.ema_l1 + (1.0 - m) * l1.detach()
+            self.ema_l2 = m * self.ema_l2 + (1.0 - m) * l2.detach()
+            self.ema_l3 = m * self.ema_l3 + (1.0 - m) * l3.detach()
+
+        # ✅ use_rqasw toggle: when False, fusion reverts to the original
+        # EDC paper's fixed equal-weight mean — same encoder/decoder/loss,
+        # only this fusion step differs. EMA buffers still update above
+        # regardless (harmless), they just don't drive p_all when off.
+        if self.use_rqasw:
+            w = _adaptive_weights(self.ema_l1, self.ema_l2, self.ema_l3)
+        else:
+            w = torch.ones(3, device=x.device) / 3.0
+        p_maps = [p1, p2_up, p3_up]
+        selected = [p_maps[l - 1] for l in self.anomap_layer]
+        w_sel    = torch.stack([w[l - 1] for l in self.anomap_layer])
+        w_sel    = w_sel / w_sel.sum()
+        p_all    = sum(w_sel[i] * selected[i] for i in range(len(selected)))
+        # ---- end RQASW --------------------------------------------------
+
+        with torch.no_grad():
+            e1_std = F.normalize(
+                e1.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+            e2_std = F.normalize(
+                e2.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+            e3_std = F.normalize(
+                e3.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+=== B. runner: where eval_dict comes from
+6:import sys
+7:import os
+13:import argparse
+14:import random
+15:import shutil
+16:import numpy as np
+17:import torch
+18:import torch.nn as nn
+19:import torch.backends.cudnn as cudnn
+20:import pandas as pd
+21:from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
+22:from collections import Counter
+24:from helper_modules.utils import get_logger, count_parameters, over_write_args_from_file
+25:from helper_modules.train_utils import TBLog, get_optimizer_v2, get_multistep_schedule_with_warmup
+26:from methods.edc1 import EDC
+27:from datasets.dataset_isic2018 import AD_Dataset
+28:from datasets.data_utils import get_data_loader
+29:from models.edc import R50_R50
+30:from configs.config_isic2018 import DATASET_DIR
+32:import warnings
+44:    """Run training with a single seed and return eval_dict."""
+130:    eval_dict = runner.train(args, device=device, logger=logger)
+132:    return eval_dict, eval_dset
+160:        eval_dict, eval_dset = run_single_seed(gpu, args, seed)
+161:        all_y_true.append(np.array(eval_dict["eval/y_true"]))
+162:        all_y_scores.append(np.array(eval_dict["eval/y_score"]))
+165:        logger.info(f"[Seed {seed}] AUC: {eval_dict['eval/AUC']:.4f}")
+169:    import time
+170:    from sklearn.metrics import precision_recall_curve
+=== C. trainer (methods/edc1.py)
+40:        return (other.end_time - self.start_time) * 1000   # ms
+52:    Always returns (H, W, 3) uint8.
+69:    return img_np
+115:    def train(self, args, device, logger=None):
+131:        best_eval_auc = 0.0
+133:        best_eval_dict = None
+215:                if tb_dict['eval/AUC'] > best_eval_auc:
+216:                    best_eval_auc = tb_dict['eval/AUC']
+218:                    best_eval_dict = dict(eval_dict)
+219:                    self.save_model('model_best.pth', save_path)
+220:                    self.print_fn(f"  -> New best AUC: {best_eval_auc:.4f} — checkpoint saved.")
+229:                    f"BEST_AUC: {best_eval_auc:.4f} @ iter {best_it}"
+251:        eval_dict.update({'eval/best_auc': best_eval_auc, 'eval/best_it': best_it})
+252:        if best_eval_dict is not None:
+254:                'eval/best_y_true':      best_eval_dict['eval/y_true'],
+255:                'eval/best_y_score':     best_eval_dict['eval/y_score'],
+256:                'eval/best_f1':          best_eval_dict['eval/f1'],
+257:                'eval/best_recall':      best_eval_dict['eval/recall'],
+258:                'eval/best_specificity': best_eval_dict['eval/specificity'],
+259:                'eval/best_acc':         best_eval_dict['eval/acc'],
+261:        return eval_dict
+267:    def evaluate(self, device, eval_loader=None, args=None, save_visual=False):
+322:            return (s - s.mean()) / (s.std() + 1e-8)
+345:            best_auc = max(AUC, AUC1, AUC2, AUC3)
+346:            if best_auc == AUC1:
+348:            elif best_auc == AUC2:
+350:            elif best_auc == AUC3:
+355:        thresh = return_best_thr(y_true, y_final)
+365:        return {
+418:    def save_model(self, save_name, save_path):
+445:            return torch.sort(flat, dim=1, descending=True)[0][:, :k].mean(dim=1)
+447:            return flat.mean(1)
+449:            return flat.max(1)[0]
+477:    return cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
+488:    return np.uint8(255 * out)
+494:        return np.zeros_like(image)
+495:    return (image - a_min) / (a_max - a_min)
+498:def return_best_thr(y_true, y_score):
+505:    return float(thrs[np.argmax(f1s)]) if len(f1s) > 0 else 0.5
+513:    return float(TN) / (N + 1e-8)

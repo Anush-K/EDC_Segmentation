@@ -1,0 +1,37 @@
+=== TIME ===
+Thu Oct  1 10:22:41 IST 2026
+=== GPU ===
+index, memory.free [MiB], memory.used [MiB]
+0, 24119 MiB, 16417 MiB
+1, 5041 MiB, 18 MiB
+=== RUNNING ===
+=== isic_rq_last ===
+modified: 2026-09-29 12:31:04.444034245 +0530
+size: 41581 bytes
+has RuntimeError: 1
+last iter line: Iter 99 | AUC 0.7051
+=== isic_edc_last ===
+modified: 2026-09-29 12:39:39.799042255 +0530
+size: 3700 bytes
+has RuntimeError: 1
+last iter line: 
+=== aptos_rq_last ===
+modified: 2026-09-29 12:39:46.083042353 +0530
+size: 3231 bytes
+has RuntimeError: 1
+last iter line: 
+=== aptos_edc_last ===
+modified: 2026-09-29 12:39:52.606042454 +0530
+size: 3231 bytes
+has RuntimeError: 1
+last iter line: 
+=== br35h_rq_last ===
+modified: 2026-09-29 12:39:58.677042548 +0530
+size: 3218 bytes
+has RuntimeError: 1
+last iter line: 
+=== br35h_edc_last ===
+modified: 2026-09-29 12:40:04.678042642 +0530
+size: 3218 bytes
+has RuntimeError: 1
+last iter line: 

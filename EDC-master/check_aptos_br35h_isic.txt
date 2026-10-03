@@ -1,0 +1,65 @@
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-07-04 13:53:22,367 INFO] Best seed: 0  AUC: 0.9585
+[2026-07-04 13:53:22,369 INFO] Final AUC: 0.9585
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-07-04 11:10:54,333 INFO] Best seed: 1  AUC: 0.9573
+[2026-07-04 11:10:54,335 INFO] Final AUC: 0.9573
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-25 11:52:54,367 INFO] Using SEED 0  Final AUC: 0.8330
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-18 07:10:25,109 INFO] Using SEED 3  Final AUC: 0.9291
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-07-01 19:16:07,244 INFO] Best seed: 1  AUC: 0.9670
+[2026-07-01 19:16:07,245 INFO] Final AUC: 0.9670
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-24 19:32:30,674 INFO] Using SEED 1  Final AUC: 0.9442
+[2026-06-25 11:09:27,833 INFO] Using SEED 0  Final AUC: 0.8350
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-25 16:14:51,457 INFO] Using SEED 0  Final AUC: 0.8350
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-25 13:56:41,936 INFO] Using SEED 0  Final AUC: 0.8295
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-17 17:25:21,450 INFO] Using ENSEMBLE seeds=[2]  Final AUC: 0.6125
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-17 16:09:13,098 INFO] Using ENSEMBLE seeds=[2]  Final AUC: 0.9304
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-16 04:50:40,967 INFO] Using ENSEMBLE seeds=[0, 1, 2, 3, 4]  Final AUC: 0.9390
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-16 22:59:26,946 INFO] Using SEED 2  Final AUC: 0.9161
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-07-04 15:19:21,649 INFO] Best seed: 3  AUC: 0.9594
+[2026-07-04 15:19:21,652 INFO] Final AUC: 0.9594
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+python3: can't open file 'last_iter_auc.py': [Errno 2] No such file or directory
+[2026-06-26 13:17:59,769 INFO] Best seed: 1  AUC: 0.8997
+[2026-06-26 13:17:59,770 INFO] Final AUC: 0.8997

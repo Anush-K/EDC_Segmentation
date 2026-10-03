@@ -1,0 +1,37 @@
+=== models/edc.py
+52:    std = torch.sqrt(feat.var(dim=0) + eps)
+53:    return torch.mean(F.relu(1.0 - std))
+96:        var_reg_weight=0.04,
+108:        self.var_reg_weight = var_reg_weight
+170:            var_loss = (variance_reg_loss(e1) +
+174:            var_loss = torch.zeros(1, device=x.device).squeeze()
+176:        loss = recon_loss + self.var_reg_weight * var_loss
+210:            e1_std = F.normalize(
+211:                e1.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+212:            e2_std = F.normalize(
+213:                e2.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+214:            e3_std = F.normalize(
+215:                e3.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+220:            'var_loss':   var_loss,
+225:            'e1_std':     e1_std,
+226:            'e2_std':     e2_std,
+227:            'e3_std':     e3_std,
+248:        var_reg_weight=0.04,
+260:        self.var_reg_weight = var_reg_weight
+305:            var_loss = (variance_reg_loss(e1) +
+309:            var_loss = torch.zeros(1, device=x.device).squeeze()
+311:        loss = recon_loss + self.var_reg_weight * var_loss
+338:            e1_std = F.normalize(
+339:                e1.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+340:            e2_std = F.normalize(
+341:                e2.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+342:            e3_std = F.normalize(
+343:                e3.detach().permute(1, 0, 2, 3).flatten(1), dim=0).std(dim=1).mean()
+346:            'loss': loss, 'recon_loss': recon_loss, 'var_loss': var_loss,
+348:            'e1_std': e1_std, 'e2_std': e2_std, 'e3_std': e3_std,
+=== methods/edc1.py
+193:                'train/var_loss':      result['var_loss'].detach().item(),
+194:                'train/e1_std':        result['e1_std'].detach().item(),
+195:                'train/e2_std':        result['e2_std'].detach().item(),
+196:                'train/e3_std':        result['e3_std'].detach().item(),
+322:            return (s - s.mean()) / (s.std() + 1e-8)

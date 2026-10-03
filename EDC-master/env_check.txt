@@ -1,0 +1,49 @@
+./runners_edc/edc_oct2017.py:120:    runner.use_tta_flip = True  # TTA: average with horizontal-flip prediction
+./runners_edc/edc_oct2017.py:121:    runner.use_tta_flip = True  # TTA: average with horizontal-flip prediction
+-----
+def get_optimizer_v2(net, optim_name='AdamW', lr=0.1, momentum=0.9, weight_decay=0, nesterov=True,
+                     lr_encoder=None, bn_no_decay=False):
+    '''
+    return optimizer (name) in torch.optim.
+    If bn_wd_skip, the optimizer does not apply
+    weight decay regularization on parameters in batch normalization.
+    '''
+    if lr_encoder is None:
+        lr_encoder = lr
+    edc_encoder = []
+    edc_encoder_bn = []
+    others = []
+    others_bn = []
+    for name, param in net.named_parameters():
+        if 'edc_encoder' in name:
+            if 'bn' in name and bn_no_decay:
+                edc_encoder_bn.append(param)
+            else:
+                edc_encoder.append(param)
+        else:
+            if 'bn' in name and bn_no_decay:
+                others_bn.append(param)
+            else:
+                others.append(param)
+
+    per_param_args = [{'params': edc_encoder, 'lr': lr_encoder},
+                      {'params': edc_encoder_bn, 'lr': lr_encoder, 'weight_decay': 0.},
+                      {'params': others, 'lr': lr},
+                      {'params': others_bn, 'lr': lr, 'weight_decay': 0.},
+                      ]
+
+    if optim_name == 'SGD':
+        optimizer = torch.optim.SGD(per_param_args, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                                    nesterov=nesterov)
+    elif optim_name == 'AdamW':
+        optimizer = torch.optim.AdamW(per_param_args, lr=lr, weight_decay=weight_decay)
+    elif optim_name == 'Adam':
+-----
+runners_edc/edc_oct2017.py:29:from models.edc import R50_R50
+runners_edc/edc_oct2017.py:94:    model = R50_R50(
+runners_edc/edc_aptos.py:29:from models.edc import R50_R50
+runners_edc/edc_aptos.py:92:    model = R50_R50(
+runners_edc/edc_br35h.py:40:from models.edc import R50_R50
+runners_edc/edc_br35h.py:106:    model = R50_R50(
+runners_edc/edc_isic2018.py:29:from models.edc import R50_R50
+runners_edc/edc_isic2018.py:94:    model = R50_R50(
