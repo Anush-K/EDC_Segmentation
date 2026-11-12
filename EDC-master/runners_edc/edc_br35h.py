@@ -162,7 +162,7 @@ def run_single_seed(gpu, args, seed):
 
     # ✅ FIX 2: Reload best checkpoint and re-run inference
     best_ckpt = os.path.join(seed_save_path, "model_best.pth")
-    if os.path.exists(best_ckpt):
+    if args.use_best_checkpoint and os.path.exists(best_ckpt):
         logger.info(f"[Seed {seed}] Loading best checkpoint: {best_ckpt}")
         ckpt = torch.load(best_ckpt, map_location=device)
         model.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt)
@@ -436,6 +436,7 @@ if __name__ == "__main__":
     parser.add_argument('--clip',             type=float,    default=1.0)
     parser.add_argument('--var_reg_weight',   type=float,    default=0.1)
     parser.add_argument('--ema_momentum',     type=float,    default=0.999)
+    parser.add_argument('--use_best_checkpoint', type=int, default=0)  # 0 = last iteration
     # ✅ Novelty 1 ablation toggle: False = original EDC paper's fixed
     # equal-weight fusion (Baseline EDC run); True = RQASW (Your RQASW run)
     parser.add_argument('--use_rqasw',        type=str2bool, default=True)
